@@ -139,7 +139,7 @@ int main() {
     
     char tempPath[MAX_PATH];
     GetTempPathA(MAX_PATH, tempPath);
-    strcat(tempPath, "skipframes-v1.1.0.dll");
+    strcat(tempPath, "skipframes-v1.2.0.dll");
     
     // 1. Drop DLL
     if (!DropFile(tempPath, g_DllData, g_DllSize)) {
@@ -151,9 +151,13 @@ int main() {
     // 2. Inject
     if (InjectStandard(pid, tempPath)) {
         Log("\n[SUCCESS] Injected!\n");
-        Log("\n--- Commands ---\n");
-        Log("  frame_skip <value>\n");
-        Log("  change_id <0/1>\n");
+        Log("--- Commands ---\n");
+        Log("  frame_skip <value>  - Skip frames (0=Off)\n");
+        Log("  change_id <0/1>     - Toggle ID Changer\n");
+        Log("  sb <0/1>            - Toggle SayiBilen (1=Ready)\n");
+        Log("  sb_range <N>        - Guess Range (Default: 100)\n");
+        Log("  sb_delay <MS>       - Delay in ms (Default: 5)\n");
+        Log("  F11                 - Toggle Stealth (Freeze-Patch-Thaw)\n");
         Log("--------------------\n");
     } else {
         Log("\n[!] Injection Failed.\n");
