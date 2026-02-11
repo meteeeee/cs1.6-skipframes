@@ -1,0 +1,9 @@
+# Ignore everything
+*
+
+# Whitelist skipframes directory
+!skipframes/
+!skipframes/**
+
+# Whitelist .gitignore itself
+!.gitignore
