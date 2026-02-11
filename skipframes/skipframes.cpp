@@ -139,7 +139,7 @@ int main() {
     
     char tempPath[MAX_PATH];
     GetTempPathA(MAX_PATH, tempPath);
-    strcat(tempPath, "skipframes.dll");
+    strcat(tempPath, "skipframes-v1.1.0.dll");
     
     // 1. Drop DLL
     if (!DropFile(tempPath, g_DllData, g_DllSize)) {
@@ -151,9 +151,10 @@ int main() {
     // 2. Inject
     if (InjectStandard(pid, tempPath)) {
         Log("\n[SUCCESS] Injected!\n");
-        Log("\n--- Command ---\n");
+        Log("\n--- Commands ---\n");
         Log("  frame_skip <value>\n");
-        Log("---------------\n");
+        Log("  change_id <0/1>\n");
+        Log("--------------------\n");
     } else {
         Log("\n[!] Injection Failed.\n");
     }
