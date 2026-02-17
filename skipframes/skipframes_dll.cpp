@@ -1,4 +1,5 @@
 #include "sayi_bilen.h"
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -37,9 +38,12 @@ BYTE g_Orig_CI[5];
 BYTE g_Orig_SI[5];
 BYTE g_Orig_Vol[5];
 
-// LOGGING (OutputDebugStringA)
+// LOGGING
+#ifdef NDEBUG
+#define Log(...) ((void)0)
+#define LogDebug(...) ((void)0)
+#else
 void Log(const char *fmt, ...) {
-#ifndef NDEBUG
   char buf[2048];
   va_list ap;
   va_start(ap, fmt);
@@ -47,11 +51,9 @@ void Log(const char *fmt, ...) {
   va_end(ap);
   buf[sizeof(buf) - 1] = 0;
   OutputDebugStringA(buf);
-#endif
 }
 
 void LogDebug(const char *fmt, ...) {
-#ifndef NDEBUG
   char buf[4096];
   va_list ap;
   va_start(ap, fmt);
@@ -59,8 +61,8 @@ void LogDebug(const char *fmt, ...) {
   va_end(ap);
   buf[sizeof(buf) - 1] = 0;
   OutputDebugStringA(buf);
-#endif
 }
+#endif
 
 // -------------------------------------------------------------
 // CVARS
@@ -81,6 +83,18 @@ cvar_t g_cvar_change_id = {"change_id", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_sb = {"sb", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_sb_delay = {"sb_delay", "5", 0, 0.0f, nullptr};
 cvar_t g_cvar_sb_range = {"sb_range", "100", 0, 0.0f, nullptr};
+cvar_t g_cvar_ct_esp = {"esp_ct", "0", 0, 0.0f, nullptr};
+cvar_t g_cvar_t_esp = {"esp_t", "0", 0, 0.0f, nullptr};
+cvar_t g_cvar_esp_type = {"esp_type", "3", 0, 0.0f,
+                          nullptr}; // 1=Glow, 2=Box, 3=Both
+cvar_t g_cvar_esp_label = {"esp_label", "0", 0, 0.0f, nullptr}; // 1=show labels
+
+// ESP Globals
+int g_PlayerTeam[33] = {0}; // 0=Unknown, 1=T, 2=CT
+
+// TriAPI WorldToScreen (built-in engine W2S)
+typedef int (*TriAPI_WorldToScreen_t)(float *world, float *screen);
+TriAPI_WorldToScreen_t g_pfnTriWorldToScreen = nullptr;
 
 // -------------------------------------------------------------
 // PATTERN SCANNING
@@ -200,10 +214,13 @@ typedef struct cl_enginefuncs_s {
                         // Let's define it as array of void*
 } cl_enginefuncs_t;
 
-// We need the offsets.
-// Index 6: pfnClientCmd
-// Index 34: pfnHookUserMsg
-// Index 40: pfnGetLocalPlayer (approx)
+// Half-Life SDK cl_enginefunc_t indices (from cdll_int.h):
+// [11] pfnFillRGBA       [12] pfnGetScreenInfo
+// [14] pfnRegisterVariable  [18] pfnHookUserMsg
+// [20] pfnClientCmd      [27] pfnDrawConsoleString
+// [28] pfnDrawSetTextColor  [40] Con_Printf
+// [51] GetLocalPlayer    [53] GetEntityByIndex
+// [82] pTriAPI (struct with WorldToScreen at offset 48)
 // We will use a raw pointer table.
 void **g_peengfuncs = nullptr;
 
@@ -211,6 +228,41 @@ void **g_peengfuncs = nullptr;
 typedef void (*DrawSetTextColor_t)(float r, float g, float b);
 typedef int (*DrawConsoleString_t)(int x, int y, const char *string);
 typedef void *(*GetLocalPlayer_t)();
+typedef void (*FillRGBA_t)(int x, int y, int w, int h, int r, int g, int b,
+                           int a);
+typedef void *(*GetEntityByIndex_t)(int idx);
+
+FillRGBA_t g_pfnFillRGBA = nullptr;
+GetEntityByIndex_t g_pfnGetEntityByIndex = nullptr;
+DrawSetTextColor_t g_pfnDrawSetTextColor = nullptr;
+DrawConsoleString_t g_pfnDrawConsoleString = nullptr;
+GetLocalPlayer_t g_pfnGetLocalPlayer = nullptr;
+
+// SCREENINFO for screen resolution
+struct SCREENINFO {
+  int iSize;
+  int iWidth;
+  int iHeight;
+  int iFlags;
+  int iCharHeight;
+  short charWidths[256];
+};
+typedef void (*GetScreenInfo_t)(SCREENINFO *pscrinfo);
+GetScreenInfo_t g_pfnGetScreenInfo = nullptr;
+
+// Player info for ESP names
+struct hud_player_info_t {
+  char *name;
+  short ping;
+  unsigned char thisplayer;
+  unsigned char spectator;
+  unsigned char packetloss;
+  char *model;
+  short topcolor;
+  short bottomcolor;
+};
+typedef void (*GetPlayerInfo_t)(int ent_num, hud_player_info_t *pinfo);
+GetPlayerInfo_t g_pfnGetPlayerInfo = nullptr;
 
 // -------------------------------------------------------------
 // HOOK TYPEDEFS
@@ -344,8 +396,7 @@ pfnUserMsgHook g_Original_ScreenFade = nullptr;
 bool g_NoFlash = true; // Use simple bool for now
 
 int __cdecl MsgFunc_SayText(const char *pszName, int iSize, void *pbuf) {
-  LogDebug("[MsgFunc_SayText] CALLED! Name=%s Size=%d\n",
-           pszName ? pszName : "NULL", iSize);
+  // (SayText received, size=%d)
 
   if (iSize > 2 && pbuf) {
     // Simple heuristic: The chat message is usually at the end of the buffer
@@ -361,7 +412,7 @@ int __cdecl MsgFunc_SayText(const char *pszName, int iSize, void *pbuf) {
           strncpy(temp, &pData[i], 255);
           temp[255] = 0;
 
-          LogDebug("[MsgFunc_SayText] Found string: '%s'\n", temp);
+          // Send to SayiBilen (no debug log)
 
           // Send to SayiBilen
           SayiBilen_OnMessage(temp); // This is INSTANT!
@@ -397,6 +448,32 @@ int __cdecl MsgFunc_ScreenFade(const char *pszName, int iSize, void *pbuf) {
   if (g_Original_ScreenFade) {
     return g_Original_ScreenFade(pszName, iSize, pbuf);
   }
+  return 0;
+}
+
+// -------------------------------------------------------------
+// ESP: TEAMINFO HOOK
+// -------------------------------------------------------------
+pfnUserMsgHook g_Original_TeamInfo = nullptr;
+int __cdecl MsgFunc_TeamInfo(const char *pszName, int iSize, void *pbuf) {
+  if (iSize > 1 && pbuf) {
+    BYTE *data = (BYTE *)pbuf;
+    int playerIdx = data[0];
+    if (playerIdx >= 1 && playerIdx <= 32) {
+      char *teamStr = (char *)(data + 1);
+      if (strcmp(teamStr, "TERRORIST") == 0)
+        g_PlayerTeam[playerIdx] = 1;
+      else if (strcmp(teamStr, "CT") == 0)
+        g_PlayerTeam[playerIdx] = 2;
+      else if (strcmp(teamStr, "SPECTATOR") == 0 ||
+               strcmp(teamStr, "UNASSIGNED") == 0)
+        g_PlayerTeam[playerIdx] = 0;
+      LogDebug("[ESP] TeamInfo: Player %d -> %s (team=%d)\n", playerIdx,
+               teamStr, g_PlayerTeam[playerIdx]);
+    }
+  }
+  if (g_Original_TeamInfo)
+    return g_Original_TeamInfo(pszName, iSize, pbuf);
   return 0;
 }
 
@@ -626,6 +703,51 @@ void FindEngineFunctions() {
   LogDebug("[ProScanner] ScreenFade hooked! Original handler: 0x%X\n",
            (DWORD)g_Original_ScreenFade);
 
+  // Hook TeamInfo for ESP team tracking
+  DWORD tiRef = FindStringRef(clientBase, 0x800000, "TeamInfo");
+  if (tiRef) {
+    for (int k = 5; k < 40; k++) {
+      if (*(BYTE *)(tiRef - k) == 0x68) {
+        DWORD funcPtr = *(DWORD *)(tiRef - k + 1);
+        if (funcPtr > clientBase && funcPtr < clientBase + 0x800000 &&
+            !IsBadReadPtr((void *)funcPtr, 4)) {
+          g_Original_TeamInfo = (pfnUserMsgHook)funcPtr;
+          LogDebug("[ESP] Found original TeamInfo handler at 0x%X\n", funcPtr);
+          break;
+        }
+      }
+    }
+  }
+  g_pfnHookUserMsg("TeamInfo", MsgFunc_TeamInfo);
+  LogDebug("[ESP] TeamInfo hooked for team tracking!\n");
+
+  // Extract ESP functions from engine table (Half-Life SDK indices)
+  g_pfnFillRGBA = (FillRGBA_t)engineTable[11];
+  g_pfnGetScreenInfo = (GetScreenInfo_t)engineTable[12];
+  g_pfnGetPlayerInfo = (GetPlayerInfo_t)engineTable[21];
+  g_pfnDrawConsoleString = (DrawConsoleString_t)engineTable[27];
+  g_pfnDrawSetTextColor = (DrawSetTextColor_t)engineTable[28];
+  g_pfnGetLocalPlayer = (GetLocalPlayer_t)engineTable[51];
+  g_pfnGetEntityByIndex = (GetEntityByIndex_t)engineTable[53];
+  LogDebug("[ESP] FillRGBA[11]=0x%X GetEntityByIndex[53]=0x%X\n",
+           (DWORD)g_pfnFillRGBA, (DWORD)g_pfnGetEntityByIndex);
+  LogDebug("[ESP] GetLocalPlayer[51]=0x%X GetPlayerInfo[21]=0x%X\n",
+           (DWORD)g_pfnGetLocalPlayer, (DWORD)g_pfnGetPlayerInfo);
+
+  // Extract pTriAPI (index 82) and get WorldToScreen from it
+  void *pTriAPI = engineTable[82];
+  if (pTriAPI && !IsBadReadPtr(pTriAPI, 64)) {
+    // triangleapi_s layout: [int version, then function pointers...]
+    // WorldToScreen is at index 12 in the struct (offset 48 bytes)
+    void **triVtable = (void **)pTriAPI;
+    g_pfnTriWorldToScreen = (TriAPI_WorldToScreen_t)triVtable[12];
+    LogDebug("[ESP] pTriAPI=0x%X WorldToScreen=0x%X\n", (DWORD)pTriAPI,
+             (DWORD)g_pfnTriWorldToScreen);
+  } else {
+    LogDebug("[ESP] WARNING: pTriAPI at index 82 is invalid (0x%X)!\n",
+             (DWORD)pTriAPI);
+  }
+
   LogDebug("[ProScanner] === ALL DONE! Engine table found! ===\n");
 }
 
@@ -742,14 +864,586 @@ DrawEngine_t g_Original_DrawEngine = nullptr;
 DWORD g_DrawEngineAddr = 0;
 BYTE g_Orig_DrawEngine_CallOffset[4] = {0}; // Original E8 offset bytes
 
+// HUD_Redraw hook (for ESP drawing - fires AFTER 3D world renders)
+typedef int(__cdecl *HUD_Redraw_t)(float time, int intermission);
+HUD_Redraw_t g_pfnHUD_Redraw = nullptr;
+DWORD g_HUD_Redraw_Addr = 0;
+BYTE g_Orig_HUD_Redraw[6] = {0};
+
+// -------------------------------------------------------------
+// GLOW ESP (Chams) - OpenGL + StudioDrawPlayer hook
+// -------------------------------------------------------------
+// OpenGL constants
+#define MY_GL_DEPTH_TEST 0x0B71
+#define MY_GL_BLEND 0x0BE2
+#define MY_GL_SRC_ALPHA 0x0302
+#define MY_GL_ONE_MINUS_SRC_ALPHA 0x0303
+#define MY_GL_ONE 0x1
+#define MY_GL_MODELVIEW 0x1700
+#define MY_GL_TEXTURE_2D 0x0DE1
+#define MY_GL_LIGHTING 0x0B50
+#define MY_GL_FLAT 0x1D00
+#define MY_GL_SMOOTH 0x1D01
+#define MY_GL_FRONT_AND_BACK 0x0408
+#define MY_GL_LINE 0x1B01
+#define MY_GL_FILL 0x1B02
+#define MY_GL_CULL_FACE 0x0B44
+#define MY_GL_FRONT 0x0404
+#define MY_GL_BACK 0x0405
+#define MY_GL_PROJECTION 0x1701
+
+// OpenGL function typedefs
+typedef void(__stdcall *glEnable_t)(unsigned int cap);
+typedef void(__stdcall *glDisable_t)(unsigned int cap);
+typedef void(__stdcall *glDepthMask_t)(unsigned char flag);
+typedef void(__stdcall *glColor4f_t)(float r, float g, float b, float a);
+typedef void(__stdcall *glBlendFunc_t)(unsigned int sfactor,
+                                       unsigned int dfactor);
+typedef void(__stdcall *glShadeModel_t)(unsigned int mode);
+typedef void(__stdcall *glDepthFunc_t)(unsigned int func);
+typedef void(__stdcall *glPolygonMode_t)(unsigned int face, unsigned int mode);
+typedef void(__stdcall *glLineWidth_t)(float width);
+typedef void(__stdcall *glCullFace_t)(unsigned int mode);
+typedef void(__stdcall *glMatrixMode_t)(unsigned int mode);
+typedef void(__stdcall *glPushMatrix_t)(void);
+typedef void(__stdcall *glPopMatrix_t)(void);
+typedef void(__stdcall *glScalef_t)(float x, float y, float z);
+
+// OpenGL function pointers
+glEnable_t g_glEnable = nullptr;
+glDisable_t g_glDisable = nullptr;
+glDepthMask_t g_glDepthMask = nullptr;
+glColor4f_t g_glColor4f = nullptr;
+glBlendFunc_t g_glBlendFunc = nullptr;
+glPolygonMode_t g_glPolygonMode = nullptr;
+glLineWidth_t g_glLineWidth = nullptr;
+glCullFace_t g_glCullFace = nullptr;
+glMatrixMode_t g_glMatrixMode = nullptr;
+glPushMatrix_t g_glPushMatrix = nullptr;
+glPopMatrix_t g_glPopMatrix = nullptr;
+glScalef_t g_glScalef = nullptr;
+
+// Studio renderer hook
+// r_studio_interface_s: { int version; StudioDrawModel; StudioDrawPlayer; }
+typedef int(__cdecl *StudioDrawPlayer_t)(int flags, void *pplayer);
+StudioDrawPlayer_t g_Original_StudioDrawPlayer = nullptr;
+void **g_pStudioInterface = nullptr; // Pointer to the interface vtable
+bool g_GlowESP_Ready = false;
+
+// Current player being drawn (set by our hook, used for team coloring)
+int g_CurrentDrawingPlayerIndex = -1;
+
+// Glow ESP hook: intercepts player model rendering
+int __cdecl Hook_StudioDrawPlayer(int flags, void *pplayer) {
+  if (!g_Original_StudioDrawPlayer)
+    return 0;
+
+  // Get player index from entity_state_s.number (offset 4 in entity_state_t)
+  int playerIndex = -1;
+  if (pplayer) {
+    playerIndex = *(int *)((char *)pplayer + 4); // entity_state_t.number
+  }
+
+  // Check if glow ESP is active for this player's team
+  bool drawCT = (g_cvar_ct_esp.value != 0.0f);
+  bool drawT = (g_cvar_t_esp.value != 0.0f);
+
+  int team = 0;
+  if (playerIndex >= 1 && playerIndex <= 32)
+    team = g_PlayerTeam[playerIndex];
+
+  bool shouldGlow = false;
+  if (team == 1 && drawT)
+    shouldGlow = true;
+  if (team == 2 && drawCT)
+    shouldGlow = true;
+
+  // Check esp_type (Glow enabled if bit 0 set: type 1 or 3)
+  int espType = (int)g_cvar_esp_type.value;
+  if (espType == 0)
+    espType = 3;
+  if (!(espType & 1))
+    shouldGlow = false;
+
+  if (!shouldGlow || !g_glEnable || !g_glDisable || !g_glColor4f ||
+      !g_glDepthMask || !g_glBlendFunc) {
+    // No glow — just draw normally
+    return g_Original_StudioDrawPlayer(flags, pplayer);
+  }
+
+  // ===== GLOW PASS: Solid color silhouette through walls =====
+  g_glDisable(MY_GL_DEPTH_TEST);             // Render through walls
+  g_glDepthMask(0);                          // Don't write depth
+  g_glEnable(MY_GL_BLEND);                   // Enable blending
+  g_glBlendFunc(MY_GL_SRC_ALPHA, MY_GL_ONE); // Additive blend for glow
+  g_glDisable(MY_GL_TEXTURE_2D);             // No textures = solid color
+
+  // Set team color (bright, semi-transparent)
+  if (team == 1)
+    g_glColor4f(1.0f, 0.1f, 0.1f, 0.6f); // Red for T
+  else
+    g_glColor4f(0.1f, 0.3f, 1.0f, 0.6f); // Blue for CT
+
+  // Draw the colored silhouette (visible through walls)
+  g_Original_StudioDrawPlayer(flags, pplayer);
+
+  // ===== NORMAL PASS: Draw with textures normally =====
+  g_glEnable(MY_GL_TEXTURE_2D); // Restore textures
+  g_glEnable(MY_GL_DEPTH_TEST); // Restore depth test
+  g_glDepthMask(1);             // Restore depth writing
+  g_glBlendFunc(MY_GL_SRC_ALPHA, MY_GL_ONE_MINUS_SRC_ALPHA);
+  g_glColor4f(1.0f, 1.0f, 1.0f, 1.0f); // Reset to white
+
+  // Draw the player normally (visible when not behind walls)
+  int ret = g_Original_StudioDrawPlayer(flags, pplayer);
+
+  return ret;
+}
+
+// Initialize OpenGL function pointers
+void InitGlowESP() {
+  HMODULE hGL = GetModuleHandleA("opengl32.dll");
+  if (!hGL) {
+    LogDebug("[Glow] opengl32.dll not found!\n");
+    return;
+  }
+
+  g_glEnable = (glEnable_t)GetProcAddress(hGL, "glEnable");
+  g_glDisable = (glDisable_t)GetProcAddress(hGL, "glDisable");
+  g_glDepthMask = (glDepthMask_t)GetProcAddress(hGL, "glDepthMask");
+  g_glColor4f = (glColor4f_t)GetProcAddress(hGL, "glColor4f");
+  g_glBlendFunc = (glBlendFunc_t)GetProcAddress(hGL, "glBlendFunc");
+  g_glPolygonMode = (glPolygonMode_t)GetProcAddress(hGL, "glPolygonMode");
+  g_glLineWidth = (glLineWidth_t)GetProcAddress(hGL, "glLineWidth");
+  g_glCullFace = (glCullFace_t)GetProcAddress(hGL, "glCullFace");
+  g_glMatrixMode = (glMatrixMode_t)GetProcAddress(hGL, "glMatrixMode");
+  g_glPushMatrix = (glPushMatrix_t)GetProcAddress(hGL, "glPushMatrix");
+  g_glPopMatrix = (glPopMatrix_t)GetProcAddress(hGL, "glPopMatrix");
+  g_glScalef = (glScalef_t)GetProcAddress(hGL, "glScalef");
+
+  LogDebug("[Glow] OpenGL: glEnable=0x%X glScalef=0x%X\n", (DWORD)g_glEnable,
+           (DWORD)g_glScalef);
+
+  // Find client.dll's studio interface
+  HMODULE hClient = GetModuleHandleA("client.dll");
+  if (!hClient) {
+    LogDebug("[Glow] client.dll not found!\n");
+    return;
+  }
+
+  // HUD_GetStudioModelInterface export
+  typedef int(__cdecl * GetStudioAPI_t)(int version, void **ppInterface,
+                                        void *pStudio);
+  GetStudioAPI_t pfnGetStudio = nullptr;
+
+  // Try different export names
+  pfnGetStudio =
+      (GetStudioAPI_t)GetProcAddress(hClient, "HUD_GetStudioModelInterface");
+  if (!pfnGetStudio)
+    pfnGetStudio = (GetStudioAPI_t)GetProcAddress(
+        hClient, "_HUD_GetStudioModelInterface@12");
+
+  if (!pfnGetStudio) {
+    LogDebug("[Glow] HUD_GetStudioModelInterface not found!\n");
+
+    // Fallback: scan for the r_studio_interface pointer in client.dll
+    // The interface vtable is stored as a global in client.dll
+    // We can find it by scanning for the pattern
+    LogDebug("[Glow] Trying fallback scan...\n");
+    return;
+  }
+
+  LogDebug("[Glow] HUD_GetStudioModelInterface at 0x%X\n", (DWORD)pfnGetStudio);
+
+  BYTE *code = (BYTE *)pfnGetStudio;
+  if (IsBadReadPtr(code, 80)) {
+    LogDebug("[Glow] Cannot read GetStudioModelInterface code!\n");
+    return;
+  }
+
+  // Hex dump first 80 bytes of the function for diagnostics
+  LogDebug("[Glow] Function bytes:\n");
+  for (int d = 0; d < 80; d += 16) {
+    char hex[128];
+    int pos = 0;
+    for (int j = 0; j < 16 && (d + j) < 80; j++) {
+      pos += sprintf(hex + pos, "%02X ", code[d + j]);
+    }
+    LogDebug("[Glow]  +%02X: %s\n", d, hex);
+  }
+
+  // Helper lambda to validate a candidate vtable address
+  // r_studio_interface_s: { int version=1; fn StudioDrawModel; fn
+  // StudioDrawPlayer; }
+  void **pInterface = nullptr;
+
+  auto tryCandidate = [&](DWORD candidate, int off,
+                          const char *pattern) -> bool {
+    if (candidate < 0x10000 || IsBadReadPtr((void *)candidate, 12))
+      return false;
+    int *pCandidate = (int *)candidate;
+    if (pCandidate[0] == 1) { // version == 1
+      DWORD fn1 = (DWORD)pCandidate[1];
+      DWORD fn2 = (DWORD)pCandidate[2];
+      if (fn1 > 0x10000 && fn2 > 0x10000 && !IsBadReadPtr((void *)fn1, 1) &&
+          !IsBadReadPtr((void *)fn2, 1)) {
+        pInterface = (void **)candidate;
+        LogDebug("[Glow] Found r_studio_interface via %s at +%d: 0x%X "
+                 "(v=%d Draw=0x%X Player=0x%X)\n",
+                 pattern, off, candidate, pCandidate[0], fn1, fn2);
+        return true;
+      }
+    }
+    return false;
+  };
+
+  for (int off = 0; off < 80 && !pInterface; off++) {
+    if (IsBadReadPtr(code + off, 7))
+      break;
+
+    BYTE b0 = code[off];
+
+    // Pattern 1: MOV reg, imm32 (B8-BF)
+    if (b0 >= 0xB8 && b0 <= 0xBF) {
+      DWORD candidate = *(DWORD *)(code + off + 1);
+      if (tryCandidate(candidate, off, "MOV reg,imm"))
+        break;
+    }
+
+    // Pattern 2: C7 00-07 XX XX XX XX  = MOV [reg], imm32
+    if (b0 == 0xC7 && code[off + 1] <= 0x07) {
+      DWORD candidate = *(DWORD *)(code + off + 2);
+      if (tryCandidate(candidate, off, "MOV [reg],imm"))
+        break;
+    }
+
+    // Pattern 3: C7 05 addr imm32 = MOV [mem32], imm32 (10 bytes)
+    if (b0 == 0xC7 && code[off + 1] == 0x05 && !IsBadReadPtr(code + off, 10)) {
+      DWORD candidate = *(DWORD *)(code + off + 6);
+      if (tryCandidate(candidate, off, "MOV [mem],imm"))
+        break;
+    }
+
+    // Pattern 4: C7 45 XX YY YY YY YY = MOV [EBP+disp8], imm32
+    if (b0 == 0xC7 && code[off + 1] == 0x45) {
+      DWORD candidate = *(DWORD *)(code + off + 3);
+      if (tryCandidate(candidate, off, "MOV [ebp+d8],imm"))
+        break;
+    }
+
+    // Pattern 5: C7 85 XX XX XX XX YY YY YY YY = MOV [EBP+disp32], imm32
+    if (b0 == 0xC7 && code[off + 1] == 0x85 && !IsBadReadPtr(code + off, 10)) {
+      DWORD candidate = *(DWORD *)(code + off + 6);
+      if (tryCandidate(candidate, off, "MOV [ebp+d32],imm"))
+        break;
+    }
+
+    // Pattern 6: 8D XX (LEA reg, [addr]) - 8D 05 = LEA EAX, [mem32]
+    if (b0 == 0x8D && (code[off + 1] & 0xC7) == 0x05) {
+      DWORD candidate = *(DWORD *)(code + off + 2);
+      if (tryCandidate(candidate, off, "LEA reg,[mem]"))
+        break;
+    }
+
+    // Pattern 7: 68 XX XX XX XX = PUSH imm32
+    if (b0 == 0x68) {
+      DWORD candidate = *(DWORD *)(code + off + 1);
+      if (tryCandidate(candidate, off, "PUSH imm"))
+        break;
+    }
+
+    // Pattern 8: A1/A3 addr = MOV EAX,[mem] / MOV [mem],EAX
+    if (b0 == 0xA1 || b0 == 0xA3) {
+      // The address itself points to a pointer that might contain the vtable
+      DWORD memAddr = *(DWORD *)(code + off + 1);
+      if (memAddr > 0x10000 && !IsBadReadPtr((void *)memAddr, 4)) {
+        DWORD candidate = *(DWORD *)memAddr;
+        if (tryCandidate(candidate, off, "MOV EAX<->mem (deref)"))
+          break;
+      }
+    }
+  }
+
+  if (!pInterface) {
+    LogDebug("[Glow] Could not find r_studio_interface vtable!\n");
+    LogDebug("[Glow] Will try brute-force scan of any 4-byte value...\n");
+
+    // Brute force: try every 4-byte aligned value in the function as a
+    // potential address
+    for (int off = 0; off < 76 && !pInterface; off++) {
+      DWORD candidate = *(DWORD *)(code + off);
+      if (tryCandidate(candidate, off, "BRUTE"))
+        break;
+    }
+  }
+
+  if (!pInterface) {
+    LogDebug("[Glow] FAILED: No r_studio_interface vtable found!\n");
+    return;
+  }
+
+  // pInterface[0] = version (1)
+  // pInterface[1] = StudioDrawModel
+  // pInterface[2] = StudioDrawPlayer
+  g_pStudioInterface = pInterface;
+  g_Original_StudioDrawPlayer = (StudioDrawPlayer_t)pInterface[2];
+
+  LogDebug("[Glow] Original StudioDrawPlayer = 0x%X\n",
+           (DWORD)g_Original_StudioDrawPlayer);
+
+  // Replace the function pointer in the vtable
+  DWORD old;
+  VirtualProtect(&pInterface[2], 4, PAGE_READWRITE, &old);
+  pInterface[2] = (void *)Hook_StudioDrawPlayer;
+  VirtualProtect(&pInterface[2], 4, old, &old);
+
+  g_GlowESP_Ready = true;
+  LogDebug("[Glow] === StudioDrawPlayer hooked! Glow ESP active! ===\n");
+}
+
+// ESP: Read 3 floats (origin) at a raw byte offset from entity pointer
+inline void ReadOrigin(void *ent, int offset, float &x, float &y, float &z) {
+  float *fp = (float *)((char *)ent + offset);
+  x = fp[0];
+  y = fp[1];
+  z = fp[2];
+}
+
+// ESP: curstate.origin offset in cl_entity_s
+// sizeof(entity_state_t) = 340 bytes (confirmed via diagnostic scan)
+// cl_entity_s: index(4) + player(4) + baseline(340) + prevstate(340) = 688
+// entity_state_t.origin is at offset 16 (entityType+number+msg_time+messagenum)
+// curstate.origin = 688 + 16 = 704 (0x2C0)
+#define ESP_ORIGIN_OFFSET 704
+
+// ESP: Draw outlined box
+void DrawBox(int x, int y, int w, int h, int r, int g, int b, int a,
+             int thickness) {
+  if (!g_pfnFillRGBA)
+    return;
+  g_pfnFillRGBA(x, y, w, thickness, r, g, b, a);                 // Top
+  g_pfnFillRGBA(x, y + h - thickness, w, thickness, r, g, b, a); // Bottom
+  g_pfnFillRGBA(x, y, thickness, h, r, g, b, a);                 // Left
+  g_pfnFillRGBA(x + w - thickness, y, thickness, h, r, g, b, a); // Right
+}
+
+// ESP: World-to-Screen using engine's TriAPI
+bool W2S(float *origin, float &screenX, float &screenY, int scrW, int scrH) {
+  if (!g_pfnTriWorldToScreen)
+    return false;
+  float screen[2];
+  // TriAPI WorldToScreen returns 1 if behind camera, 0 if visible
+  if (g_pfnTriWorldToScreen(origin, screen))
+    return false;
+  // screen[] is in NDC: -1..1 range
+  screenX = (1.0f + screen[0]) * scrW * 0.5f;
+  screenY = (1.0f - screen[1]) * scrH * 0.5f;
+  return true;
+}
+
 int __cdecl Hook_DrawEngine() {
   // Call Original (Draws Server HUD)
   int ret = 0;
   if (g_Original_DrawEngine) {
     ret = g_Original_DrawEngine();
   }
-  // NOTE: SayiBilen_Update is called from Hook_SCR_Trampoline (assembly)
-  // Do NOT call it here too — that would be a duplicate per-frame call.
+  // ESP drawing moved to Hook_HUD_Redraw (fires after 3D scene)
+  return ret;
+}
+
+// ===== HUD_REDRAW HOOK (ESP drawing happens here, after 3D world) =====
+int __cdecl Hook_HUD_Redraw(float time, int intermission) {
+  // Call original HUD_Redraw (patch/unpatch method)
+  int ret = 0;
+  if (g_HUD_Redraw_Addr) {
+    DWORD old;
+    VirtualProtect((void *)g_HUD_Redraw_Addr, 6, PAGE_EXECUTE_READWRITE, &old);
+    memcpy((void *)g_HUD_Redraw_Addr, g_Orig_HUD_Redraw, 6);
+    VirtualProtect((void *)g_HUD_Redraw_Addr, 6, old, &old);
+
+    ret = g_pfnHUD_Redraw(time, intermission);
+
+    VirtualProtect((void *)g_HUD_Redraw_Addr, 6, PAGE_EXECUTE_READWRITE, &old);
+    BYTE patch[5] = {0xE9, 0, 0, 0, 0};
+    *(DWORD *)(patch + 1) = (DWORD)Hook_HUD_Redraw - g_HUD_Redraw_Addr - 5;
+    memcpy((void *)g_HUD_Redraw_Addr, patch, 5);
+    if (6 > 5)
+      memset((void *)(g_HUD_Redraw_Addr + 5), 0x90, 1);
+    VirtualProtect((void *)g_HUD_Redraw_Addr, 6, old, &old);
+  }
+
+  // ===== ESP DRAWING =====
+  bool drawCT = (g_cvar_ct_esp.value != 0.0f);
+  bool drawT = (g_cvar_t_esp.value != 0.0f);
+
+  // Check esp_type (1=Glow, 2=Box, 3=Both)
+  int espType = (int)g_cvar_esp_type.value;
+  if (espType == 0)
+    espType = 3; // Default
+
+  // BOX enabled if type is 2 or 3 (Bit 1 set)
+  bool drawBox = (espType & 2);
+
+  if (drawBox && (drawCT || drawT) && g_pfnFillRGBA && g_pfnTriWorldToScreen &&
+      g_pfnGetEntityByIndex) {
+
+    int scrW = 800, scrH = 600;
+    if (g_pfnGetScreenInfo) {
+      static SCREENINFO scr;
+      scr.iSize = sizeof(SCREENINFO);
+      g_pfnGetScreenInfo(&scr);
+      if (scr.iWidth > 0)
+        scrW = scr.iWidth;
+      if (scr.iHeight > 0)
+        scrH = scr.iHeight;
+    }
+
+    // Cache local player pointer (once for distance calc)
+    void *localEnt = g_pfnGetLocalPlayer ? g_pfnGetLocalPlayer() : nullptr;
+    float localX = 0, localY = 0, localZ = 0;
+    if (localEnt)
+      ReadOrigin(localEnt, ESP_ORIGIN_OFFSET, localX, localY, localZ);
+
+    // Cache label setting
+    bool showLabels = (g_cvar_esp_label.value != 0.0f);
+
+    for (int i = 1; i <= 32; i++) {
+      // 1. Check Team
+      int team = g_PlayerTeam[i];
+      if (team == 0)
+        continue;
+      if (team == 1 && !drawT)
+        continue;
+      if (team == 2 && !drawCT)
+        continue;
+
+      // 2. Anti-Ghost Check + Get Player Name (reused for labels)
+      char playerName[32] = {0};
+      if (g_pfnGetPlayerInfo) {
+        hud_player_info_t info;
+        memset(&info, 0, sizeof(info));
+        g_pfnGetPlayerInfo(i, &info);
+        if (!info.name || !info.name[0])
+          continue; // Invalid/ghost player
+        strncpy(playerName, info.name, 31);
+        playerName[31] = '\0';
+      }
+
+      // 3. Get Entity Pointer (simple null check, no IsBadReadPtr)
+      void *ent = g_pfnGetEntityByIndex(i);
+      if (!ent)
+        continue;
+
+      // Check curstate.modelindex (offset 728 = 688+40) - skip dormant/dead
+      int modelIdx = *(int *)((char *)ent + ESP_ORIGIN_OFFSET + 24);
+      if (modelIdx == 0)
+        continue;
+
+      float ox, oy, oz;
+      ReadOrigin(ent, ESP_ORIGIN_OFFSET, ox, oy, oz);
+      if (ox == 0.0f && oy == 0.0f && oz == 0.0f)
+        continue;
+
+      // GoldSrc origin is at player waist (center of hull)
+      float feetOrigin[3] = {ox, oy, oz - 36.0f};
+      float headOrigin[3] = {ox, oy, oz + 36.0f};
+      float feetX, feetY, headX, headY;
+
+      if (!W2S(feetOrigin, feetX, feetY, scrW, scrH))
+        continue;
+      if (!W2S(headOrigin, headX, headY, scrW, scrH))
+        continue;
+
+      float boxHeight = feetY - headY;
+      if (boxHeight < 4.0f)
+        continue;
+      if (boxHeight > scrH)
+        continue;
+      float boxWidth = boxHeight * 0.5f;
+
+      int bx = (int)(headX - boxWidth / 2.0f);
+      int by = (int)headY;
+      int bw = (int)boxWidth;
+      int bh = (int)boxHeight;
+
+      if (bx + bw < 0 || bx > scrW || by + bh < 0 || by > scrH)
+        continue;
+
+      // Color: Red for T, Blue for CT
+      int cr = 0, cg = 0, cb = 0;
+      if (team == 1) {
+        cr = 255;
+        cg = 50;
+        cb = 50;
+      }
+      if (team == 2) {
+        cr = 50;
+        cg = 100;
+        cb = 255;
+      }
+
+      DrawBox(bx, by, bw, bh, cr, cg, cb, 200, 2);
+
+      // Draw player name + distance (gated by esp_label)
+      if (showLabels && boxHeight > 20.0f && g_pfnDrawSetTextColor &&
+          g_pfnDrawConsoleString) {
+
+        // Truncate name when far (small box)
+        if (boxHeight < 40.0f && strlen(playerName) > 8)
+          playerName[8] = '\0';
+        else if (boxHeight < 80.0f && strlen(playerName) > 15)
+          playerName[15] = '\0';
+
+        // Calculate distance (using cached local player pos)
+        float dist = 0;
+        if (localEnt) {
+          float dx = ox - localX, dy = oy - localY, dz = oz - localZ;
+          dist = sqrt(dx * dx + dy * dy + dz * dz);
+        }
+
+        // Calculate scaling based on distance (using box height)
+        // Box Height 100+ -> Scale 1.0
+        // Box Height 20 -> Scale 0.5
+        float scale = 1.0f;
+        if (boxHeight < 100.0f) {
+          scale = 0.5f + (boxHeight / 200.0f); // 0.5 ... 1.0 range approx
+        }
+        if (scale < 0.5f)
+          scale = 0.5f;
+        if (scale > 1.0f)
+          scale = 1.0f;
+
+        g_pfnDrawSetTextColor((float)cr / 255.0f, (float)cg / 255.0f,
+                              (float)cb / 255.0f);
+        char label[96];
+        sprintf(label, "%s [%.0fm]", playerName, dist / 40.0f);
+
+        // Apply GL scaling
+        if (g_glMatrixMode && g_glPushMatrix && g_glPopMatrix && g_glScalef) {
+          int labelGap = (boxHeight > 60.0f) ? 14 : 10;
+          float drawX = (float)bx;
+          float drawY = (float)(by - labelGap);
+
+          // To scale text "in place", we must scale coordinate system
+          // If we scale by 0.5, coordinates must be doubled to stay same screen
+          // pos
+          g_glMatrixMode(MY_GL_PROJECTION);
+          g_glPushMatrix();
+          g_glScalef(scale, scale, 1.0f);
+
+          g_pfnDrawConsoleString((int)(drawX / scale), (int)(drawY / scale),
+                                 label);
+
+          g_glPopMatrix();
+        } else {
+          // Fallback no scaling
+          int labelGap = (boxHeight > 60.0f) ? 14 : 10;
+          g_pfnDrawConsoleString(bx, by - labelGap, label);
+        }
+      }
+    }
+  }
+
   return ret;
 }
 
@@ -885,6 +1579,30 @@ void InstallHooks() {
     LogDebug("[Hooks] WARNING: g_pfnConPrintf is NULL, skipping hook.\n");
   }
 
+  // Install HUD_Redraw hook (for ESP drawing after 3D scene)
+  if (!g_HUD_Redraw_Addr) {
+    HMODULE hClient = GetModuleHandleA("client.dll");
+    if (hClient) {
+      g_pfnHUD_Redraw = (HUD_Redraw_t)GetProcAddress(hClient, "_HUD_Redraw@8");
+      if (!g_pfnHUD_Redraw)
+        g_pfnHUD_Redraw = (HUD_Redraw_t)GetProcAddress(hClient, "HUD_Redraw");
+      if (g_pfnHUD_Redraw) {
+        g_HUD_Redraw_Addr = (DWORD)g_pfnHUD_Redraw;
+        LogDebug("[Hooks] Found HUD_Redraw at 0x%X\n", g_HUD_Redraw_Addr);
+      } else {
+        LogDebug("[Hooks] WARNING: HUD_Redraw not found in client.dll!\n");
+      }
+    }
+  }
+  if (g_HUD_Redraw_Addr) {
+    WriteJMP(g_HUD_Redraw_Addr, (DWORD)Hook_HUD_Redraw, g_Orig_HUD_Redraw, 6);
+    LogDebug("[Hooks] HUD_Redraw hooked at 0x%X -> 0x%X\n", g_HUD_Redraw_Addr,
+             (DWORD)Hook_HUD_Redraw);
+  }
+
+  // Initialize Glow ESP (StudioDrawPlayer hook)
+  InitGlowESP();
+
   g_HooksActive = true;
 }
 
@@ -902,6 +1620,8 @@ void RemoveHooks() {
     Restore(g_GetVolumeInfo, g_Orig_Vol, 5);
   if (g_pfnConPrintf)
     Restore((DWORD)g_pfnConPrintf, g_Orig_ConPrintf, 6);
+  if (g_HUD_Redraw_Addr)
+    Restore(g_HUD_Redraw_Addr, g_Orig_HUD_Redraw, 6);
 
   // Restore DrawEngine CALL offset (CRITICAL - was missing before!)
   if (g_DrawEngineAddr) {
@@ -921,6 +1641,17 @@ void RemoveHooks() {
   }
 
   PatchByte(g_HwBase + OFF_CMD_PATCH, 0x74);
+
+  // Restore StudioDrawPlayer (Glow ESP)
+  if (g_pStudioInterface && g_Original_StudioDrawPlayer) {
+    DWORD old;
+    VirtualProtect(&g_pStudioInterface[2], 4, PAGE_READWRITE, &old);
+    g_pStudioInterface[2] = (void *)g_Original_StudioDrawPlayer;
+    VirtualProtect(&g_pStudioInterface[2], 4, old, &old);
+    g_GlowESP_Ready = false;
+    LogDebug("[Glow] StudioDrawPlayer restored\n");
+  }
+
   g_HooksActive = false;
 }
 
@@ -1066,6 +1797,10 @@ DWORD WINAPI MainThread(LPVOID) {
     g_RegisterCvar(&g_cvar_sb);
     g_RegisterCvar(&g_cvar_sb_delay);
     g_RegisterCvar(&g_cvar_sb_range);
+    g_RegisterCvar(&g_cvar_ct_esp);
+    g_RegisterCvar(&g_cvar_t_esp);
+    g_RegisterCvar(&g_cvar_esp_type);
+    g_RegisterCvar(&g_cvar_esp_label);
   }
 
   InstallHooks();

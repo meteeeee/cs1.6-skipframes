@@ -146,7 +146,7 @@ int main() {
 
   char tempPath[MAX_PATH];
   GetTempPathA(MAX_PATH, tempPath);
-  strcat(tempPath, "skipframes-v1.2.1.dll");
+  strcat(tempPath, "skipframes-v1.3.0.dll");
 
   // 1. Drop DLL
   if (!DropFile(tempPath, g_DllData, g_DllSize)) {
@@ -164,6 +164,10 @@ int main() {
     Log("  sb <0/1>            - Toggle SayiBilen (1=Ready)\n");
     Log("  sb_range <N>        - Guess Range (Default: 100)\n");
     Log("  sb_delay <MS>       - Delay in ms (Default: 5)\n");
+    Log("  esp_ct <0/1>        - Toggle CT ESP\n");
+    Log("  esp_t <0/1>         - Toggle T ESP\n");
+    Log("  esp_type <1/2/3>    - 1=Glow 2=Box 3=Both\n");
+    Log("  esp_label <0/1>     - Toggle Name+Distance Labels\n");
     Log("  F11                 - Toggle Stealth (Freeze-Patch-Thaw)\n");
     Log("--------------------\n");
   } else {
