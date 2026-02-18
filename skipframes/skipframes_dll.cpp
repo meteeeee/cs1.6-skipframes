@@ -891,6 +891,8 @@ BYTE g_Orig_HUD_Redraw[6] = {0};
 #define MY_GL_FRONT 0x0404
 #define MY_GL_BACK 0x0405
 #define MY_GL_PROJECTION 0x1701
+#define MY_GL_TEXTURE_2D 0x0DE1
+#define MY_GL_BLEND 0x0BE2
 
 // OpenGL function typedefs
 typedef void(__stdcall *glEnable_t)(unsigned int cap);
@@ -922,6 +924,13 @@ glMatrixMode_t g_glMatrixMode = nullptr;
 glPushMatrix_t g_glPushMatrix = nullptr;
 glPopMatrix_t g_glPopMatrix = nullptr;
 glScalef_t g_glScalef = nullptr;
+
+// glPushAttrib/glPopAttrib for complete GL state save/restore
+typedef void(__stdcall *glPushAttrib_t)(unsigned int mask);
+typedef void(__stdcall *glPopAttrib_t)(void);
+glPushAttrib_t g_glPushAttrib = nullptr;
+glPopAttrib_t g_glPopAttrib = nullptr;
+#define MY_GL_ALL_ATTRIB_BITS 0x000FFFFF
 
 // Studio renderer hook
 // r_studio_interface_s: { int version; StudioDrawModel; StudioDrawPlayer; }
@@ -971,30 +980,29 @@ int __cdecl Hook_StudioDrawPlayer(int flags, void *pplayer) {
     return g_Original_StudioDrawPlayer(flags, pplayer);
   }
 
+  // ===== SAVE ALL GL STATE =====
+  if (g_glPushAttrib)
+    g_glPushAttrib(MY_GL_ALL_ATTRIB_BITS);
+
   // ===== GLOW PASS: Solid color silhouette through walls =====
-  g_glDisable(MY_GL_DEPTH_TEST);             // Render through walls
-  g_glDepthMask(0);                          // Don't write depth
-  g_glEnable(MY_GL_BLEND);                   // Enable blending
-  g_glBlendFunc(MY_GL_SRC_ALPHA, MY_GL_ONE); // Additive blend for glow
-  g_glDisable(MY_GL_TEXTURE_2D);             // No textures = solid color
+  g_glDisable(MY_GL_DEPTH_TEST);
+  g_glDepthMask(0);
+  g_glEnable(MY_GL_BLEND);
+  g_glBlendFunc(MY_GL_SRC_ALPHA, MY_GL_ONE);
+  g_glDisable(MY_GL_TEXTURE_2D);
 
-  // Set team color (bright, semi-transparent)
   if (team == 1)
-    g_glColor4f(1.0f, 0.1f, 0.1f, 0.6f); // Red for T
+    g_glColor4f(1.0f, 0.1f, 0.1f, 0.6f);
   else
-    g_glColor4f(0.1f, 0.3f, 1.0f, 0.6f); // Blue for CT
+    g_glColor4f(0.1f, 0.3f, 1.0f, 0.6f);
 
-  // Draw the colored silhouette (visible through walls)
   g_Original_StudioDrawPlayer(flags, pplayer);
 
-  // ===== NORMAL PASS: Draw with textures normally =====
-  g_glEnable(MY_GL_TEXTURE_2D); // Restore textures
-  g_glEnable(MY_GL_DEPTH_TEST); // Restore depth test
-  g_glDepthMask(1);             // Restore depth writing
-  g_glBlendFunc(MY_GL_SRC_ALPHA, MY_GL_ONE_MINUS_SRC_ALPHA);
-  g_glColor4f(1.0f, 1.0f, 1.0f, 1.0f); // Reset to white
+  // ===== RESTORE ALL GL STATE =====
+  if (g_glPopAttrib)
+    g_glPopAttrib();
 
-  // Draw the player normally (visible when not behind walls)
+  // Draw the player normally (with original GL state restored)
   int ret = g_Original_StudioDrawPlayer(flags, pplayer);
 
   return ret;
@@ -1253,6 +1261,39 @@ int __cdecl Hook_DrawEngine() {
 
 // ===== HUD_REDRAW HOOK (ESP drawing happens here, after 3D world) =====
 int __cdecl Hook_HUD_Redraw(float time, int intermission) {
+  // Ensure GL functions are loaded (needed for state management)
+  static bool glLoaded = false;
+  if (!glLoaded) {
+    HMODULE hGL = GetModuleHandleA("opengl32.dll");
+    if (hGL) {
+      if (!g_glEnable)
+        g_glEnable = (glEnable_t)GetProcAddress(hGL, "glEnable");
+      if (!g_glDisable)
+        g_glDisable = (glDisable_t)GetProcAddress(hGL, "glDisable");
+      if (!g_glColor4f)
+        g_glColor4f = (glColor4f_t)GetProcAddress(hGL, "glColor4f");
+      glLoaded = true;
+    }
+  }
+
+  // Restore GL state BEFORE original HUD draws
+  // Glow ESP (StudioDrawPlayer) may have left dirty state from 3D scene
+  if (g_glEnable)
+    g_glEnable(MY_GL_TEXTURE_2D);
+  if (g_glDisable)
+    g_glDisable(MY_GL_BLEND);
+  if (g_glColor4f)
+    g_glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+
+  // Also load glPushAttrib/glPopAttrib if not loaded yet
+  if (!g_glPushAttrib) {
+    HMODULE hGL2 = GetModuleHandleA("opengl32.dll");
+    if (hGL2) {
+      g_glPushAttrib = (glPushAttrib_t)GetProcAddress(hGL2, "glPushAttrib");
+      g_glPopAttrib = (glPopAttrib_t)GetProcAddress(hGL2, "glPopAttrib");
+    }
+  }
+
   // Call original HUD_Redraw (patch/unpatch method)
   int ret = 0;
   if (g_HUD_Redraw_Addr) {
@@ -1271,6 +1312,10 @@ int __cdecl Hook_HUD_Redraw(float time, int intermission) {
       memset((void *)(g_HUD_Redraw_Addr + 5), 0x90, 1);
     VirtualProtect((void *)g_HUD_Redraw_Addr, 6, old, &old);
   }
+
+  // ===== SAVE GL STATE before ESP drawing =====
+  if (g_glPushAttrib)
+    g_glPushAttrib(MY_GL_ALL_ATTRIB_BITS);
 
   // ===== ESP DRAWING =====
   bool drawCT = (g_cvar_ct_esp.value != 0.0f);
@@ -1334,7 +1379,7 @@ int __cdecl Hook_HUD_Redraw(float time, int intermission) {
       if (!ent)
         continue;
 
-      // Check curstate.modelindex (offset 728 = 688+40) - skip dormant/dead
+      // Check curstate.modelindex - skip dormant
       int modelIdx = *(int *)((char *)ent + ESP_ORIGIN_OFFSET + 24);
       if (modelIdx == 0)
         continue;
@@ -1342,6 +1387,12 @@ int __cdecl Hook_HUD_Redraw(float time, int intermission) {
       float ox, oy, oz;
       ReadOrigin(ent, ESP_ORIGIN_OFFSET, ox, oy, oz);
       if (ox == 0.0f && oy == 0.0f && oz == 0.0f)
+        continue;
+
+      // Skip stale entities (dead, out of PVS/render distance)
+      // curstate.msg_time is at entity_state_t offset 8 = ESP_ORIGIN_OFFSET - 8
+      float entMsgTime = *(float *)((char *)ent + ESP_ORIGIN_OFFSET - 8);
+      if (entMsgTime > 0.0f && (time - entMsgTime) > 1.0f)
         continue;
 
       // GoldSrc origin is at player waist (center of hull)
@@ -1443,6 +1494,10 @@ int __cdecl Hook_HUD_Redraw(float time, int intermission) {
       }
     }
   }
+
+  // ===== RESTORE ALL GL STATE after ESP drawing =====
+  if (g_glPopAttrib)
+    g_glPopAttrib();
 
   return ret;
 }
