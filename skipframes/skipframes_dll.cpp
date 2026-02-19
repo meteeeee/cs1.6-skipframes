@@ -8,11 +8,8 @@
 #include <tlhelp32.h>
 #include <vector>
 #include <windows.h>
-
-// =============================================================
-// SKIPFRAMES + VALVE_ID FORCE (RELEASE BUILD)
-// =============================================================
-
+//
+//
 #define OFF_CVAR_REG 0x2E960
 #define OFF_CMD_PATCH 0x2809D
 #define OFF_SCR_UPDATE 0x4C2A0
@@ -88,6 +85,9 @@ cvar_t g_cvar_t_esp = {"esp_t", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_esp_type = {"esp_type", "3", 0, 0.0f,
                           nullptr}; // 1=Glow, 2=Box, 3=Both
 cvar_t g_cvar_esp_label = {"esp_label", "0", 0, 0.0f, nullptr}; // 1=show labels
+// [NEW] Help Command
+cvar_t g_cvar_sf_help = {"sf_help", "0", 0, 0.0f, nullptr};
+cvar_t g_cvar_no_smoke = {"no_smoke", "1", 0, 1.0f, nullptr};
 
 // ESP Globals
 int g_PlayerTeam[33] = {0}; // 0=Unknown, 1=T, 2=CT
@@ -213,6 +213,9 @@ typedef struct cl_enginefuncs_s {
                         // Standard SDK: ClientCmd is index 6?
                         // Let's define it as array of void*
 } cl_enginefuncs_t;
+
+// Global pointer to the engine table (array of void*)
+void **g_EngineTable = nullptr;
 
 // Half-Life SDK cl_enginefunc_t indices (from cdll_int.h):
 // [11] pfnFillRGBA       [12] pfnGetScreenInfo
@@ -393,7 +396,241 @@ void Hook_ConPrintf(const char *fmt, void *a1, void *a2, void *a3) {
 pfnUserMsgHook g_Original_SayText = nullptr;
 pfnUserMsgHook g_Original_ScreenFade = nullptr;
 
-bool g_NoFlash = true; // Use simple bool for now
+bool g_NoFlash = true; // Block ScreenFade
+bool g_NoSmoke = true; // Block smoke sprites
+
+// No-Smoke: Core Engine Sprite Hooks
+// We hook the actual sprite rendering functions in the engine table.
+// This is robust because ALL sprites (temp ents, env_sprite, etc.) use these.
+
+void WriteJMP(DWORD from, DWORD to, BYTE *storage, int len);
+void Restore(DWORD from, BYTE *storage, int len);
+
+typedef void(__cdecl *SPR_Set_t)(int hPic, int r, int g, int b);
+typedef void(__cdecl *SPR_Draw_t)(int frame, int x, int y, const void *prc);
+typedef void(__cdecl *SPR_DrawHoles_t)(int frame, int x, int y,
+                                       const void *prc);
+typedef void(__cdecl *SPR_DrawAdditive_t)(int frame, int x, int y,
+                                          const void *prc);
+
+SPR_Set_t g_Original_SPR_Set = nullptr;
+SPR_Draw_t g_Original_SPR_Draw = nullptr;
+SPR_Draw_t g_Original_SPR_DrawHoles = nullptr;
+SPR_Draw_t g_Original_SPR_DrawAdditive = nullptr;
+
+BYTE g_Orig_SPR_Set[10] = {0};
+BYTE g_Orig_SPR_Draw[10] = {0};
+BYTE g_Orig_SPR_DrawHoles[10] = {0};
+BYTE g_Orig_SPR_DrawAdditive[10] = {0};
+
+// State to track if the current sprite operation should be blocked
+bool g_BlockCurrentSprite = false;
+
+typedef int(__cdecl *SPR_Load_t)(const char *pTextureName);
+SPR_Load_t g_pfnSPR_Load = nullptr;
+SPR_Load_t g_pfnSPR_Load_Original = nullptr;
+bool g_Original_SPR_Load_Hook = false;
+
+// Hook for SPR_Load (Index 0)
+int __cdecl Hook_SPR_Load(const char *name) {
+  // LogDebug("[SPR_Load] %s\n", name);
+  if (g_NoSmoke && name &&
+      (strstr(name, "gas_puff") || strstr(name, "smoke") ||
+       strstr(name, "black_smoke"))) {
+    LogDebug("[NoSmoke] Blocked loading of %s via SPR_Load Hook!\n", name);
+    return 0; // Block it
+  }
+  if (g_pfnSPR_Load_Original)
+    return g_pfnSPR_Load_Original(name);
+  return 0;
+}
+
+// Multiple smoke model indices (different CS builds use different sprites)
+#define MAX_SMOKE_MODELS 5
+int g_SmokeModelIndices[MAX_SMOKE_MODELS] = {-1, -1, -1, -1, -1};
+int g_NumSmokeModels = 0;
+
+// No-Smoke: Smoke creation function patch (legacy, kept for F11 stealth)
+DWORD g_SmokeFuncAddr = 0;
+BYTE g_SmokeFuncOrigByte = 0;
+
+// =============================================================
+// EfxAPI HOOKS (Indices 49, 50, 54, 55, 58)
+// To catch ALL possible smoke creation methods!
+// =============================================================
+void *g_pEfxAPI = nullptr;
+
+// Helper: Lazy-load smoke sprites
+void EnsureSmokeModelsLoaded() {
+  LogDebug("[NoSmoke] EnsureSmokeModelsLoaded() called (Count=%d)\n",
+           g_NumSmokeModels);
+  if (g_NumSmokeModels <= 0 && g_pfnSPR_Load) {
+    static bool triedLoading = false;
+    if (!triedLoading) {
+      triedLoading = true;
+      const char *smokeSprites[] = {
+          "sprites/gas_puff_01.spr",  "sprites/smokepuff.spr",
+          "sprites/smoke.spr",        "sprites/black_smoke1.spr",
+          "sprites/black_smoke4.spr", "sprites/steam1.spr"};
+      for (int i = 0; i < 6 && g_NumSmokeModels < MAX_SMOKE_MODELS; i++) {
+        int idx = g_pfnSPR_Load(smokeSprites[i]);
+        if (idx > 0) {
+          g_SmokeModelIndices[g_NumSmokeModels++] = idx;
+          LogDebug("[NoSmoke] Loaded %s -> handle %d\n", smokeSprites[i], idx);
+        }
+      }
+    }
+  }
+}
+
+// --- Index 49: R_Sprite_Explosion ---
+BYTE g_Orig_R_Sprite_Explosion[10] = {0};
+typedef void(__cdecl *R_Sprite_Explosion_t)(float *pos, int modelIndex,
+                                            int count);
+R_Sprite_Explosion_t g_Original_R_Sprite_Explosion = nullptr;
+
+void __cdecl Hook_R_Sprite_Explosion(float *pos, int modelIndex, int count) {
+  EnsureSmokeModelsLoaded();
+
+  // Debug Log
+  static int logCount = 0;
+  if (logCount < 10) {
+    LogDebug("[R_Sprite_Explosion] modelIndex=%d count=%d\n", modelIndex,
+             count);
+    logCount++;
+  }
+
+  // Filter
+  if (g_NoSmoke && g_NumSmokeModels > 0) {
+    for (int i = 0; i < g_NumSmokeModels; i++) {
+      if (modelIndex == g_SmokeModelIndices[i])
+        return; // Block
+    }
+  }
+
+  Restore((DWORD)g_Original_R_Sprite_Explosion, g_Orig_R_Sprite_Explosion, 5);
+  if (g_Original_R_Sprite_Explosion)
+    g_Original_R_Sprite_Explosion(pos, modelIndex, count);
+  WriteJMP((DWORD)g_Original_R_Sprite_Explosion, (DWORD)Hook_R_Sprite_Explosion,
+           g_Orig_R_Sprite_Explosion, 5);
+}
+
+// --- Index 50: R_TempSprite (Existing) ---
+BYTE g_Orig_R_TempSprite[10] = {0};
+typedef void *(__cdecl *R_TempSprite_t)(float *pos, float *dir, float scale,
+                                        int modelIndex, int rendermode,
+                                        int renderfx, float a, float life,
+                                        int flags);
+R_TempSprite_t g_Original_R_TempSprite = nullptr;
+
+// --- Index 55: R_ParticleExplosion ---
+BYTE g_Orig_R_ParticleExplosion[10] = {0};
+typedef void(__cdecl *R_ParticleExplosion_t)(float *org, int r, int g, int b,
+                                             int style);
+R_ParticleExplosion_t g_Original_R_ParticleExplosion = nullptr;
+
+void __cdecl Hook_R_ParticleExplosion(float *org, int r, int g, int b,
+                                      int style) {
+  // Just log for now
+  static int logCount = 0;
+  if (logCount < 10) {
+    LogDebug("[R_ParticleExplosion] RGB=%d,%d,%d style=%d\n", r, g, b, style);
+    logCount++;
+  }
+
+  Restore((DWORD)g_Original_R_ParticleExplosion, g_Orig_R_ParticleExplosion, 5);
+  if (g_Original_R_ParticleExplosion)
+    g_Original_R_ParticleExplosion(org, r, g, b, style);
+  WriteJMP((DWORD)g_Original_R_ParticleExplosion,
+           (DWORD)Hook_R_ParticleExplosion, g_Orig_R_ParticleExplosion, 5);
+}
+
+// --- Index 58: R_RocketTrail ---
+BYTE g_Orig_R_RocketTrail[10] = {0};
+typedef void(__cdecl *R_RocketTrail_t)(float *start, float *end, int type);
+R_RocketTrail_t g_Original_R_RocketTrail = nullptr;
+
+void __cdecl Hook_R_RocketTrail(float *start, float *end, int type) {
+  // Just log
+  static int logCount = 0;
+  if (logCount < 10) {
+    LogDebug("[R_RocketTrail] type=%d\n", type);
+    logCount++;
+  }
+
+  Restore((DWORD)g_Original_R_RocketTrail, g_Orig_R_RocketTrail, 5);
+  if (g_Original_R_RocketTrail)
+    g_Original_R_RocketTrail(start, end, type);
+  WriteJMP((DWORD)g_Original_R_RocketTrail, (DWORD)Hook_R_RocketTrail,
+           g_Orig_R_RocketTrail, 5);
+}
+
+void *__cdecl Hook_R_TempSprite(float *pos, float *dir, float scale,
+                                int modelIndex, int rendermode, int renderfx,
+                                float a, float life, int flags) {
+  // Lazy-load smoke sprites if not loaded yet (e.g. if InstallHooks ran
+  // before map load)
+  if (g_NumSmokeModels <= 0 && g_pfnSPR_Load) {
+    static bool triedLoading = false;
+    if (!triedLoading) {
+      triedLoading = true;
+      LogDebug("[NoSmoke] Lazy-loading smoke sprites...\n");
+      const char *smokeSprites[] = {
+          "sprites/gas_puff_01.spr",  "sprites/smokepuff.spr",
+          "sprites/smoke.spr",        "sprites/black_smoke1.spr",
+          "sprites/black_smoke4.spr", "sprites/steam1.spr"};
+      for (int i = 0; i < 6 && g_NumSmokeModels < MAX_SMOKE_MODELS; i++) {
+        int idx = g_pfnSPR_Load(smokeSprites[i]);
+        if (idx > 0) {
+          g_SmokeModelIndices[g_NumSmokeModels++] = idx;
+          LogDebug("[NoSmoke] Loaded %s -> handle %d\n", smokeSprites[i], idx);
+        } else {
+          LogDebug("[NoSmoke] Failed to load %s\n", smokeSprites[i]);
+        }
+      }
+    }
+  }
+
+  // Debug Logging: Log first few calls to see what's happening
+  static int debugLogCount = 0;
+  if (debugLogCount < 50) {
+    // Create a small cache of logged indices to avoid spamming the same one
+    static int loggedIndices[50];
+    bool seen = false;
+    for (int k = 0; k < debugLogCount; k++)
+      if (loggedIndices[k] == modelIndex)
+        seen = true;
+    if (!seen) {
+      loggedIndices[debugLogCount++] = modelIndex;
+      LogDebug("[R_TempSprite] Called with modelIndex=%d flags=%d\n",
+               modelIndex, flags);
+    }
+  }
+
+  // Check if this model is smoke
+  if (g_NoSmoke && g_NumSmokeModels > 0) {
+    for (int i = 0; i < g_NumSmokeModels; i++) {
+      if (modelIndex == g_SmokeModelIndices[i]) {
+        // LogDebug("[NoSmoke] Blocked R_TempSprite smoke (idx %d)\n",
+        // modelIndex);
+        return nullptr; // Block creation! (Return NULL = temp ent not
+                        // created)
+      }
+    }
+  }
+
+  // Restore & Call Original
+  Restore((DWORD)g_Original_R_TempSprite, g_Orig_R_TempSprite, 5);
+  void *ret = nullptr;
+  if (g_Original_R_TempSprite)
+    ret = g_Original_R_TempSprite(pos, dir, scale, modelIndex, rendermode,
+                                  renderfx, a, life, flags);
+
+  // Rehook
+  WriteJMP((DWORD)g_Original_R_TempSprite, (DWORD)Hook_R_TempSprite,
+           g_Orig_R_TempSprite, 5);
+  return ret;
+}
 
 int __cdecl MsgFunc_SayText(const char *pszName, int iSize, void *pbuf) {
   // (SayText received, size=%d)
@@ -441,14 +678,82 @@ int __cdecl MsgFunc_SayText(const char *pszName, int iSize, void *pbuf) {
 }
 
 int __cdecl MsgFunc_ScreenFade(const char *pszName, int iSize, void *pbuf) {
-  LogDebug("[ScreenFade] Blocked Flash!\n"); // DEBUG LOG
   if (g_NoFlash) {
-    return 0; // BLOCK IT!
+    LogDebug("[NoFlash] Blocked ScreenFade!\n");
+    return 0;
   }
   if (g_Original_ScreenFade) {
     return g_Original_ScreenFade(pszName, iSize, pbuf);
   }
   return 0;
+}
+
+// Globals for storing original function bytes (trampoline)
+
+// No-Smoke: Hook SPR_Set (Engine Index 4) - TABLE HOOK
+void __cdecl Hook_SPR_Set(int hPic, int r, int g, int b) {
+  g_BlockCurrentSprite = false;
+
+  // Lazy-load smoke sprites on first use
+  if (g_NumSmokeModels == 0 && g_pfnSPR_Load) {
+    const char *smokeSprites[] = {
+        "sprites/gas_puff_01.spr", "sprites/smokepuff.spr", "sprites/smoke.spr",
+        "sprites/black_smoke1.spr", "sprites/black_smoke4.spr"};
+    for (int i = 0; i < 5 && g_NumSmokeModels < MAX_SMOKE_MODELS; i++) {
+      int idx = g_pfnSPR_Load(smokeSprites[i]); // Safe (index 0 original ptr)
+      if (idx > 0) {
+        g_SmokeModelIndices[g_NumSmokeModels++] = idx;
+        LogDebug("[NoSmoke] Loaded %s -> handle %d\n", smokeSprites[i], idx);
+      }
+    }
+    if (g_NumSmokeModels == 0)
+      g_NumSmokeModels = -1;
+  }
+
+  // Debug Log
+  static int sprSetLogCount = 0;
+  if (sprSetLogCount < 50) {
+    LogDebug("[SPR_Set] hPic=%d\n", hPic);
+    sprSetLogCount++;
+  }
+
+  // Filter
+  if (g_NoSmoke && g_NumSmokeModels > 0) {
+    for (int i = 0; i < g_NumSmokeModels; i++) {
+      if (hPic == g_SmokeModelIndices[i]) {
+        g_BlockCurrentSprite = true;
+        break;
+      }
+    }
+  }
+
+  // Call Original (Via global function pointer)
+  if (g_Original_SPR_Set)
+    g_Original_SPR_Set(hPic, r, g, b);
+}
+
+// No-Smoke: Hook SPR_Draw (Engine Index 5) - TABLE HOOK
+void __cdecl Hook_SPR_Draw(int frame, int x, int y, const void *prc) {
+  if (!g_BlockCurrentSprite || !g_NoSmoke) {
+    if (g_Original_SPR_Draw)
+      g_Original_SPR_Draw(frame, x, y, prc);
+  }
+}
+
+// No-Smoke: Hook SPR_DrawHoles (Engine Index 6) - TABLE HOOK
+void __cdecl Hook_SPR_DrawHoles(int frame, int x, int y, const void *prc) {
+  if (!g_BlockCurrentSprite || !g_NoSmoke) {
+    if (g_Original_SPR_DrawHoles)
+      g_Original_SPR_DrawHoles(frame, x, y, prc);
+  }
+}
+
+// No-Smoke: Hook SPR_DrawAdditive (Engine Index 7) - TABLE HOOK
+void __cdecl Hook_SPR_DrawAdditive(int frame, int x, int y, const void *prc) {
+  if (!g_BlockCurrentSprite || !g_NoSmoke) {
+    if (g_Original_SPR_DrawAdditive)
+      g_Original_SPR_DrawAdditive(frame, x, y, prc);
+  }
 }
 
 // -------------------------------------------------------------
@@ -512,8 +817,8 @@ void FindEngineFunctions() {
   }
   LogDebug("[ProScanner] Initialize bytes: %s\n", hexDump);
 
-  // PRIORITY 1: Look for BF XX XX XX XX followed by F3 A5 (MOV EDI, imm32 + REP
-  // MOVSD) This is how Build 8684 copies the engine table via memcpy!
+  // PRIORITY 1: Look for BF XX XX XX XX followed by F3 A5 (MOV EDI, imm32 +
+  // REP MOVSD) This is how Build 8684 copies the engine table via memcpy!
   for (int i = 0; i < 128; i++) {
     if (IsBadReadPtr(pCode + i, 7))
       break;
@@ -613,6 +918,7 @@ void FindEngineFunctions() {
 
   // Step 4: Extract functions (indices from Half-Life SDK cdll_int.h)
   g_peengfuncs = engineTable;
+  g_EngineTable = engineTable; // CRITICAL FIX: Set global table pointer!
 
   g_pfnHookUserMsg = (pfnHookUserMsg_t)engineTable[18];
   LogDebug("[ProScanner] pfnHookUserMsg [18] = 0x%X\n",
@@ -747,6 +1053,47 @@ void FindEngineFunctions() {
     LogDebug("[ESP] WARNING: pTriAPI at index 82 is invalid (0x%X)!\n",
              (DWORD)pTriAPI);
   }
+
+  // --- NO SMOKE: INLINE PATCH R_Sprite_Smoke in hw.dll ---
+  // The engine calls R_Sprite_Smoke DIRECTLY (not through a vtable).
+  // So we must patch the ACTUAL FUNCTION CODE in hw.dll, not a table entry.
+  // We get the real function address from pEfxAPI (engine effects API).
+  g_pEfxAPI = engineTable[83]; // Store globally for hooking R_TempSprite
+  void *pEfxAPI = g_pEfxAPI;
+  if (pEfxAPI && !IsBadReadPtr(pEfxAPI, 200)) {
+    void **efxTable = (void **)pEfxAPI;
+
+    // R_Sprite_Smoke is at EfxAPI index 38 (per GoldSrc SDK)
+    DWORD smokeFunc = (DWORD)efxTable[38];
+    LogDebug("[NoSmoke] pEfxAPI=0x%X R_Sprite_Smoke=0x%X\n", (DWORD)pEfxAPI,
+             smokeFunc);
+
+    // Also try R_TempSprite at index 50 as backup info
+    LogDebug("[NoSmoke] R_TempSprite[50]=0x%X\n", (DWORD)efxTable[50]);
+
+    if (smokeFunc && !IsBadReadPtr((void *)smokeFunc, 1)) {
+      g_SmokeFuncAddr = smokeFunc;
+      g_SmokeFuncOrigByte = *(BYTE *)smokeFunc;
+
+      // Patch: write RET (0xC3) at the entry point
+      DWORD old;
+      VirtualProtect((void *)smokeFunc, 1, PAGE_EXECUTE_READWRITE, &old);
+      *(BYTE *)smokeFunc = 0xC3; // RET = function does nothing
+      VirtualProtect((void *)smokeFunc, 1, old, &old);
+
+      LogDebug("[NoSmoke] INLINE PATCHED R_Sprite_Smoke @ 0x%X! "
+               "(orig byte=0x%02X -> 0xC3)\n",
+               smokeFunc, g_SmokeFuncOrigByte);
+    } else {
+      LogDebug("[NoSmoke] WARNING: R_Sprite_Smoke address invalid!\n");
+    }
+  } else {
+    LogDebug("[NoSmoke] WARNING: pEfxAPI[83]=0x%X invalid!\n", (DWORD)pEfxAPI);
+  }
+
+  // Extract SPR_Load for potential future use
+  g_pfnSPR_Load = (SPR_Load_t)engineTable[0];
+  LogDebug("[NoSmoke] SPR_Load[0]=0x%X\n", (DWORD)g_pfnSPR_Load);
 
   LogDebug("[ProScanner] === ALL DONE! Engine table found! ===\n");
 }
@@ -947,6 +1294,11 @@ int __cdecl Hook_StudioDrawPlayer(int flags, void *pplayer) {
   if (!g_Original_StudioDrawPlayer)
     return 0;
 
+  // [Failsafe] If stealth mode is active (hooks removed), stop rendering glow
+  // immediately
+  if (!g_HooksActive)
+    return g_Original_StudioDrawPlayer(flags, pplayer);
+
   // Get player index from entity_state_s.number (offset 4 in entity_state_t)
   int playerIndex = -1;
   if (pplayer) {
@@ -1010,203 +1362,208 @@ int __cdecl Hook_StudioDrawPlayer(int flags, void *pplayer) {
 
 // Initialize OpenGL function pointers
 void InitGlowESP() {
-  HMODULE hGL = GetModuleHandleA("opengl32.dll");
-  if (!hGL) {
-    LogDebug("[Glow] opengl32.dll not found!\n");
-    return;
-  }
+  static bool s_Scanned = false;
 
-  g_glEnable = (glEnable_t)GetProcAddress(hGL, "glEnable");
-  g_glDisable = (glDisable_t)GetProcAddress(hGL, "glDisable");
-  g_glDepthMask = (glDepthMask_t)GetProcAddress(hGL, "glDepthMask");
-  g_glColor4f = (glColor4f_t)GetProcAddress(hGL, "glColor4f");
-  g_glBlendFunc = (glBlendFunc_t)GetProcAddress(hGL, "glBlendFunc");
-  g_glPolygonMode = (glPolygonMode_t)GetProcAddress(hGL, "glPolygonMode");
-  g_glLineWidth = (glLineWidth_t)GetProcAddress(hGL, "glLineWidth");
-  g_glCullFace = (glCullFace_t)GetProcAddress(hGL, "glCullFace");
-  g_glMatrixMode = (glMatrixMode_t)GetProcAddress(hGL, "glMatrixMode");
-  g_glPushMatrix = (glPushMatrix_t)GetProcAddress(hGL, "glPushMatrix");
-  g_glPopMatrix = (glPopMatrix_t)GetProcAddress(hGL, "glPopMatrix");
-  g_glScalef = (glScalef_t)GetProcAddress(hGL, "glScalef");
-
-  LogDebug("[Glow] OpenGL: glEnable=0x%X glScalef=0x%X\n", (DWORD)g_glEnable,
-           (DWORD)g_glScalef);
-
-  // Find client.dll's studio interface
-  HMODULE hClient = GetModuleHandleA("client.dll");
-  if (!hClient) {
-    LogDebug("[Glow] client.dll not found!\n");
-    return;
-  }
-
-  // HUD_GetStudioModelInterface export
-  typedef int(__cdecl * GetStudioAPI_t)(int version, void **ppInterface,
-                                        void *pStudio);
-  GetStudioAPI_t pfnGetStudio = nullptr;
-
-  // Try different export names
-  pfnGetStudio =
-      (GetStudioAPI_t)GetProcAddress(hClient, "HUD_GetStudioModelInterface");
-  if (!pfnGetStudio)
-    pfnGetStudio = (GetStudioAPI_t)GetProcAddress(
-        hClient, "_HUD_GetStudioModelInterface@12");
-
-  if (!pfnGetStudio) {
-    LogDebug("[Glow] HUD_GetStudioModelInterface not found!\n");
-
-    // Fallback: scan for the r_studio_interface pointer in client.dll
-    // The interface vtable is stored as a global in client.dll
-    // We can find it by scanning for the pattern
-    LogDebug("[Glow] Trying fallback scan...\n");
-    return;
-  }
-
-  LogDebug("[Glow] HUD_GetStudioModelInterface at 0x%X\n", (DWORD)pfnGetStudio);
-
-  BYTE *code = (BYTE *)pfnGetStudio;
-  if (IsBadReadPtr(code, 80)) {
-    LogDebug("[Glow] Cannot read GetStudioModelInterface code!\n");
-    return;
-  }
-
-  // Hex dump first 80 bytes of the function for diagnostics
-  LogDebug("[Glow] Function bytes:\n");
-  for (int d = 0; d < 80; d += 16) {
-    char hex[128];
-    int pos = 0;
-    for (int j = 0; j < 16 && (d + j) < 80; j++) {
-      pos += sprintf(hex + pos, "%02X ", code[d + j]);
+  // --- PHASE 1: ONE-TIME SCANNING ---
+  if (!s_Scanned) {
+    HMODULE hGL = GetModuleHandleA("opengl32.dll");
+    if (!hGL) {
+      LogDebug("[Glow] opengl32.dll not found!\n");
+      return;
     }
-    LogDebug("[Glow]  +%02X: %s\n", d, hex);
-  }
 
-  // Helper lambda to validate a candidate vtable address
-  // r_studio_interface_s: { int version=1; fn StudioDrawModel; fn
-  // StudioDrawPlayer; }
-  void **pInterface = nullptr;
+    g_glEnable = (glEnable_t)GetProcAddress(hGL, "glEnable");
+    g_glDisable = (glDisable_t)GetProcAddress(hGL, "glDisable");
+    g_glDepthMask = (glDepthMask_t)GetProcAddress(hGL, "glDepthMask");
+    g_glColor4f = (glColor4f_t)GetProcAddress(hGL, "glColor4f");
+    g_glBlendFunc = (glBlendFunc_t)GetProcAddress(hGL, "glBlendFunc");
+    g_glPolygonMode = (glPolygonMode_t)GetProcAddress(hGL, "glPolygonMode");
+    g_glLineWidth = (glLineWidth_t)GetProcAddress(hGL, "glLineWidth");
+    g_glCullFace = (glCullFace_t)GetProcAddress(hGL, "glCullFace");
+    g_glMatrixMode = (glMatrixMode_t)GetProcAddress(hGL, "glMatrixMode");
+    g_glPushMatrix = (glPushMatrix_t)GetProcAddress(hGL, "glPushMatrix");
+    g_glPopMatrix = (glPopMatrix_t)GetProcAddress(hGL, "glPopMatrix");
+    g_glScalef = (glScalef_t)GetProcAddress(hGL, "glScalef");
 
-  auto tryCandidate = [&](DWORD candidate, int off,
-                          const char *pattern) -> bool {
-    if (candidate < 0x10000 || IsBadReadPtr((void *)candidate, 12))
+    LogDebug("[Glow] OpenGL: glEnable=0x%X glScalef=0x%X\n", (DWORD)g_glEnable,
+             (DWORD)g_glScalef);
+
+    // Find client.dll's studio interface
+    HMODULE hClient = GetModuleHandleA("client.dll");
+    if (!hClient) {
+      LogDebug("[Glow] client.dll not found!\n");
+      return;
+    }
+
+    // HUD_GetStudioModelInterface export
+    typedef int(__cdecl * GetStudioAPI_t)(int version, void **ppInterface,
+                                          void *pStudio);
+    GetStudioAPI_t pfnGetStudio = nullptr;
+
+    // Try different export names
+    pfnGetStudio =
+        (GetStudioAPI_t)GetProcAddress(hClient, "HUD_GetStudioModelInterface");
+    if (!pfnGetStudio)
+      pfnGetStudio = (GetStudioAPI_t)GetProcAddress(
+          hClient, "_HUD_GetStudioModelInterface@12");
+
+    if (!pfnGetStudio) {
+      LogDebug("[Glow] HUD_GetStudioModelInterface not found!\n");
+      return;
+    }
+
+    LogDebug("[Glow] HUD_GetStudioModelInterface at 0x%X\n",
+             (DWORD)pfnGetStudio);
+
+    BYTE *code = (BYTE *)pfnGetStudio;
+    if (IsBadReadPtr(code, 80)) {
+      LogDebug("[Glow] Cannot read GetStudioModelInterface code!\n");
+      return;
+    }
+
+    // Hex dump first 80 bytes of the function for diagnostics
+    LogDebug("[Glow] Function bytes:\n");
+    for (int d = 0; d < 80; d += 16) {
+      char hex[128];
+      int pos = 0;
+      for (int j = 0; j < 16 && (d + j) < 80; j++) {
+        pos += sprintf(hex + pos, "%02X ", code[d + j]);
+      }
+      LogDebug("[Glow]  +%02X: %s\n", d, hex);
+    }
+
+    // Helper lambda to validate a candidate vtable address
+    // r_studio_interface_s: { int version=1; fn StudioDrawModel; fn
+    // StudioDrawPlayer; }
+    void **pInterface = nullptr;
+
+    auto tryCandidate = [&](DWORD candidate, int off,
+                            const char *pattern) -> bool {
+      if (candidate < 0x10000 || IsBadReadPtr((void *)candidate, 12))
+        return false;
+      int *pCandidate = (int *)candidate;
+      if (pCandidate[0] == 1) { // version == 1
+        DWORD fn1 = (DWORD)pCandidate[1];
+        DWORD fn2 = (DWORD)pCandidate[2];
+        if (fn1 > 0x10000 && fn2 > 0x10000 && !IsBadReadPtr((void *)fn1, 1) &&
+            !IsBadReadPtr((void *)fn2, 1)) {
+          pInterface = (void **)candidate;
+          LogDebug("[Glow] Found r_studio_interface via %s at +%d: 0x%X "
+                   "(v=%d Draw=0x%X Player=0x%X)\n",
+                   pattern, off, candidate, pCandidate[0], fn1, fn2);
+          return true;
+        }
+      }
       return false;
-    int *pCandidate = (int *)candidate;
-    if (pCandidate[0] == 1) { // version == 1
-      DWORD fn1 = (DWORD)pCandidate[1];
-      DWORD fn2 = (DWORD)pCandidate[2];
-      if (fn1 > 0x10000 && fn2 > 0x10000 && !IsBadReadPtr((void *)fn1, 1) &&
-          !IsBadReadPtr((void *)fn2, 1)) {
-        pInterface = (void **)candidate;
-        LogDebug("[Glow] Found r_studio_interface via %s at +%d: 0x%X "
-                 "(v=%d Draw=0x%X Player=0x%X)\n",
-                 pattern, off, candidate, pCandidate[0], fn1, fn2);
-        return true;
+    };
+
+    for (int off = 0; off < 80 && !pInterface; off++) {
+      if (IsBadReadPtr(code + off, 7))
+        break;
+
+      BYTE b0 = code[off];
+
+      // Pattern 1: MOV reg, imm32 (B8-BF)
+      if (b0 >= 0xB8 && b0 <= 0xBF) {
+        DWORD candidate = *(DWORD *)(code + off + 1);
+        if (tryCandidate(candidate, off, "MOV reg,imm"))
+          break;
+      }
+
+      // Pattern 2: C7 00-07 XX XX XX XX  = MOV [reg], imm32
+      if (b0 == 0xC7 && code[off + 1] <= 0x07) {
+        DWORD candidate = *(DWORD *)(code + off + 2);
+        if (tryCandidate(candidate, off, "MOV [reg],imm"))
+          break;
+      }
+
+      // Pattern 3: C7 05 addr imm32 = MOV [mem32], imm32 (10 bytes)
+      if (b0 == 0xC7 && code[off + 1] == 0x05 &&
+          !IsBadReadPtr(code + off, 10)) {
+        DWORD candidate = *(DWORD *)(code + off + 6);
+        if (tryCandidate(candidate, off, "MOV [mem],imm"))
+          break;
+      }
+
+      // Pattern 4: C7 45 XX YY YY YY YY = MOV [EBP+disp8], imm32
+      if (b0 == 0xC7 && code[off + 1] == 0x45) {
+        DWORD candidate = *(DWORD *)(code + off + 3);
+        if (tryCandidate(candidate, off, "MOV [ebp+d8],imm"))
+          break;
+      }
+
+      // Pattern 5: C7 85 XX XX XX XX YY YY YY YY = MOV [EBP+disp32], imm32
+      if (b0 == 0xC7 && code[off + 1] == 0x85 &&
+          !IsBadReadPtr(code + off, 10)) {
+        DWORD candidate = *(DWORD *)(code + off + 6);
+        if (tryCandidate(candidate, off, "MOV [ebp+d32],imm"))
+          break;
+      }
+
+      // Pattern 6: 8D XX (LEA reg, [addr]) - 8D 05 = LEA EAX, [mem32]
+      if (b0 == 0x8D && (code[off + 1] & 0xC7) == 0x05) {
+        DWORD candidate = *(DWORD *)(code + off + 2);
+        if (tryCandidate(candidate, off, "LEA reg,[mem]"))
+          break;
+      }
+
+      // Pattern 7: 68 XX XX XX XX = PUSH imm32
+      if (b0 == 0x68) {
+        DWORD candidate = *(DWORD *)(code + off + 1);
+        if (tryCandidate(candidate, off, "PUSH imm"))
+          break;
+      }
+
+      // Pattern 8: A1/A3 addr = MOV EAX,[mem] / MOV [mem],EAX
+      if (b0 == 0xA1 || b0 == 0xA3) {
+        // The address itself points to a pointer that might contain the vtable
+        DWORD memAddr = *(DWORD *)(code + off + 1);
+        if (memAddr > 0x10000 && !IsBadReadPtr((void *)memAddr, 4)) {
+          DWORD candidate = *(DWORD *)memAddr;
+          if (tryCandidate(candidate, off, "MOV EAX<->mem (deref)"))
+            break;
+        }
       }
     }
-    return false;
-  };
 
-  for (int off = 0; off < 80 && !pInterface; off++) {
-    if (IsBadReadPtr(code + off, 7))
-      break;
+    if (!pInterface) {
+      LogDebug("[Glow] Could not find r_studio_interface vtable!\n");
+      LogDebug("[Glow] Will try brute-force scan of any 4-byte value...\n");
 
-    BYTE b0 = code[off];
-
-    // Pattern 1: MOV reg, imm32 (B8-BF)
-    if (b0 >= 0xB8 && b0 <= 0xBF) {
-      DWORD candidate = *(DWORD *)(code + off + 1);
-      if (tryCandidate(candidate, off, "MOV reg,imm"))
-        break;
-    }
-
-    // Pattern 2: C7 00-07 XX XX XX XX  = MOV [reg], imm32
-    if (b0 == 0xC7 && code[off + 1] <= 0x07) {
-      DWORD candidate = *(DWORD *)(code + off + 2);
-      if (tryCandidate(candidate, off, "MOV [reg],imm"))
-        break;
-    }
-
-    // Pattern 3: C7 05 addr imm32 = MOV [mem32], imm32 (10 bytes)
-    if (b0 == 0xC7 && code[off + 1] == 0x05 && !IsBadReadPtr(code + off, 10)) {
-      DWORD candidate = *(DWORD *)(code + off + 6);
-      if (tryCandidate(candidate, off, "MOV [mem],imm"))
-        break;
-    }
-
-    // Pattern 4: C7 45 XX YY YY YY YY = MOV [EBP+disp8], imm32
-    if (b0 == 0xC7 && code[off + 1] == 0x45) {
-      DWORD candidate = *(DWORD *)(code + off + 3);
-      if (tryCandidate(candidate, off, "MOV [ebp+d8],imm"))
-        break;
-    }
-
-    // Pattern 5: C7 85 XX XX XX XX YY YY YY YY = MOV [EBP+disp32], imm32
-    if (b0 == 0xC7 && code[off + 1] == 0x85 && !IsBadReadPtr(code + off, 10)) {
-      DWORD candidate = *(DWORD *)(code + off + 6);
-      if (tryCandidate(candidate, off, "MOV [ebp+d32],imm"))
-        break;
-    }
-
-    // Pattern 6: 8D XX (LEA reg, [addr]) - 8D 05 = LEA EAX, [mem32]
-    if (b0 == 0x8D && (code[off + 1] & 0xC7) == 0x05) {
-      DWORD candidate = *(DWORD *)(code + off + 2);
-      if (tryCandidate(candidate, off, "LEA reg,[mem]"))
-        break;
-    }
-
-    // Pattern 7: 68 XX XX XX XX = PUSH imm32
-    if (b0 == 0x68) {
-      DWORD candidate = *(DWORD *)(code + off + 1);
-      if (tryCandidate(candidate, off, "PUSH imm"))
-        break;
-    }
-
-    // Pattern 8: A1/A3 addr = MOV EAX,[mem] / MOV [mem],EAX
-    if (b0 == 0xA1 || b0 == 0xA3) {
-      // The address itself points to a pointer that might contain the vtable
-      DWORD memAddr = *(DWORD *)(code + off + 1);
-      if (memAddr > 0x10000 && !IsBadReadPtr((void *)memAddr, 4)) {
-        DWORD candidate = *(DWORD *)memAddr;
-        if (tryCandidate(candidate, off, "MOV EAX<->mem (deref)"))
+      // Brute force: try every 4-byte aligned value in the function as a
+      // potential address
+      for (int off = 0; off < 76 && !pInterface; off++) {
+        DWORD candidate = *(DWORD *)(code + off);
+        if (tryCandidate(candidate, off, "BRUTE"))
           break;
       }
     }
-  }
 
-  if (!pInterface) {
-    LogDebug("[Glow] Could not find r_studio_interface vtable!\n");
-    LogDebug("[Glow] Will try brute-force scan of any 4-byte value...\n");
-
-    // Brute force: try every 4-byte aligned value in the function as a
-    // potential address
-    for (int off = 0; off < 76 && !pInterface; off++) {
-      DWORD candidate = *(DWORD *)(code + off);
-      if (tryCandidate(candidate, off, "BRUTE"))
-        break;
+    if (!pInterface) {
+      LogDebug("[Glow] FAILED: No r_studio_interface vtable found!\n");
+      return;
     }
+
+    // Only set these ONCE
+    g_pStudioInterface = pInterface;
+    g_Original_StudioDrawPlayer = (StudioDrawPlayer_t)pInterface[2];
+    s_Scanned = true; // Mark as scanned
+
+    LogDebug("[Glow] Original StudioDrawPlayer = 0x%X\n",
+             (DWORD)g_Original_StudioDrawPlayer);
   }
 
-  if (!pInterface) {
-    LogDebug("[Glow] FAILED: No r_studio_interface vtable found!\n");
-    return;
+  // --- PHASE 2: INSTALLATION ---
+  // Always run this part if scan was successful
+  if (s_Scanned && g_pStudioInterface && g_Original_StudioDrawPlayer) {
+    DWORD old;
+    VirtualProtect(&g_pStudioInterface[2], 4, PAGE_READWRITE, &old);
+    g_pStudioInterface[2] = (void *)Hook_StudioDrawPlayer;
+    VirtualProtect(&g_pStudioInterface[2], 4, old, &old);
+
+    g_GlowESP_Ready = true;
+    LogDebug("[Glow] === StudioDrawPlayer hooked! Glow ESP active! ===\n");
   }
-
-  // pInterface[0] = version (1)
-  // pInterface[1] = StudioDrawModel
-  // pInterface[2] = StudioDrawPlayer
-  g_pStudioInterface = pInterface;
-  g_Original_StudioDrawPlayer = (StudioDrawPlayer_t)pInterface[2];
-
-  LogDebug("[Glow] Original StudioDrawPlayer = 0x%X\n",
-           (DWORD)g_Original_StudioDrawPlayer);
-
-  // Replace the function pointer in the vtable
-  DWORD old;
-  VirtualProtect(&pInterface[2], 4, PAGE_READWRITE, &old);
-  pInterface[2] = (void *)Hook_StudioDrawPlayer;
-  VirtualProtect(&pInterface[2], 4, old, &old);
-
-  g_GlowESP_Ready = true;
-  LogDebug("[Glow] === StudioDrawPlayer hooked! Glow ESP active! ===\n");
 }
 
 // ESP: Read 3 floats (origin) at a raw byte offset from entity pointer
@@ -1318,178 +1675,181 @@ int __cdecl Hook_HUD_Redraw(float time, int intermission) {
     g_glPushAttrib(MY_GL_ALL_ATTRIB_BITS);
 
   // ===== ESP DRAWING =====
-  bool drawCT = (g_cvar_ct_esp.value != 0.0f);
-  bool drawT = (g_cvar_t_esp.value != 0.0f);
+  if (g_HooksActive) {
+    bool drawCT = (g_cvar_ct_esp.value != 0.0f);
+    bool drawT = (g_cvar_t_esp.value != 0.0f);
 
-  // Check esp_type (1=Glow, 2=Box, 3=Both)
-  int espType = (int)g_cvar_esp_type.value;
-  if (espType == 0)
-    espType = 3; // Default
+    // Check esp_type (1=Glow, 2=Box, 3=Both)
+    int espType = (int)g_cvar_esp_type.value;
+    if (espType == 0)
+      espType = 3; // Default
 
-  // BOX enabled if type is 2 or 3 (Bit 1 set)
-  bool drawBox = (espType & 2);
+    // BOX enabled if type is 2 or 3 (Bit 1 set)
+    bool drawBox = (espType & 2);
 
-  if (drawBox && (drawCT || drawT) && g_pfnFillRGBA && g_pfnTriWorldToScreen &&
-      g_pfnGetEntityByIndex) {
+    if (drawBox && (drawCT || drawT) && g_pfnFillRGBA &&
+        g_pfnTriWorldToScreen && g_pfnGetEntityByIndex) {
 
-    int scrW = 800, scrH = 600;
-    if (g_pfnGetScreenInfo) {
-      static SCREENINFO scr;
-      scr.iSize = sizeof(SCREENINFO);
-      g_pfnGetScreenInfo(&scr);
-      if (scr.iWidth > 0)
-        scrW = scr.iWidth;
-      if (scr.iHeight > 0)
-        scrH = scr.iHeight;
-    }
-
-    // Cache local player pointer (once for distance calc)
-    void *localEnt = g_pfnGetLocalPlayer ? g_pfnGetLocalPlayer() : nullptr;
-    float localX = 0, localY = 0, localZ = 0;
-    if (localEnt)
-      ReadOrigin(localEnt, ESP_ORIGIN_OFFSET, localX, localY, localZ);
-
-    // Cache label setting
-    bool showLabels = (g_cvar_esp_label.value != 0.0f);
-
-    for (int i = 1; i <= 32; i++) {
-      // 1. Check Team
-      int team = g_PlayerTeam[i];
-      if (team == 0)
-        continue;
-      if (team == 1 && !drawT)
-        continue;
-      if (team == 2 && !drawCT)
-        continue;
-
-      // 2. Anti-Ghost Check + Get Player Name (reused for labels)
-      char playerName[32] = {0};
-      if (g_pfnGetPlayerInfo) {
-        hud_player_info_t info;
-        memset(&info, 0, sizeof(info));
-        g_pfnGetPlayerInfo(i, &info);
-        if (!info.name || !info.name[0])
-          continue; // Invalid/ghost player
-        strncpy(playerName, info.name, 31);
-        playerName[31] = '\0';
+      int scrW = 800, scrH = 600;
+      if (g_pfnGetScreenInfo) {
+        static SCREENINFO scr;
+        scr.iSize = sizeof(SCREENINFO);
+        g_pfnGetScreenInfo(&scr);
+        if (scr.iWidth > 0)
+          scrW = scr.iWidth;
+        if (scr.iHeight > 0)
+          scrH = scr.iHeight;
       }
 
-      // 3. Get Entity Pointer (simple null check, no IsBadReadPtr)
-      void *ent = g_pfnGetEntityByIndex(i);
-      if (!ent)
-        continue;
+      // Cache local player pointer (once for distance calc)
+      void *localEnt = g_pfnGetLocalPlayer ? g_pfnGetLocalPlayer() : nullptr;
+      float localX = 0, localY = 0, localZ = 0;
+      if (localEnt)
+        ReadOrigin(localEnt, ESP_ORIGIN_OFFSET, localX, localY, localZ);
 
-      // Check curstate.modelindex - skip dormant
-      int modelIdx = *(int *)((char *)ent + ESP_ORIGIN_OFFSET + 24);
-      if (modelIdx == 0)
-        continue;
+      // Cache label setting
+      bool showLabels = (g_cvar_esp_label.value != 0.0f);
 
-      float ox, oy, oz;
-      ReadOrigin(ent, ESP_ORIGIN_OFFSET, ox, oy, oz);
-      if (ox == 0.0f && oy == 0.0f && oz == 0.0f)
-        continue;
+      for (int i = 1; i <= 32; i++) {
+        // 1. Check Team
+        int team = g_PlayerTeam[i];
+        if (team == 0)
+          continue;
+        if (team == 1 && !drawT)
+          continue;
+        if (team == 2 && !drawCT)
+          continue;
 
-      // Skip stale entities (dead, out of PVS/render distance)
-      // curstate.msg_time is at entity_state_t offset 8 = ESP_ORIGIN_OFFSET - 8
-      float entMsgTime = *(float *)((char *)ent + ESP_ORIGIN_OFFSET - 8);
-      if (entMsgTime > 0.0f && (time - entMsgTime) > 1.0f)
-        continue;
-
-      // GoldSrc origin is at player waist (center of hull)
-      float feetOrigin[3] = {ox, oy, oz - 36.0f};
-      float headOrigin[3] = {ox, oy, oz + 36.0f};
-      float feetX, feetY, headX, headY;
-
-      if (!W2S(feetOrigin, feetX, feetY, scrW, scrH))
-        continue;
-      if (!W2S(headOrigin, headX, headY, scrW, scrH))
-        continue;
-
-      float boxHeight = feetY - headY;
-      if (boxHeight < 4.0f)
-        continue;
-      if (boxHeight > scrH)
-        continue;
-      float boxWidth = boxHeight * 0.5f;
-
-      int bx = (int)(headX - boxWidth / 2.0f);
-      int by = (int)headY;
-      int bw = (int)boxWidth;
-      int bh = (int)boxHeight;
-
-      if (bx + bw < 0 || bx > scrW || by + bh < 0 || by > scrH)
-        continue;
-
-      // Color: Red for T, Blue for CT
-      int cr = 0, cg = 0, cb = 0;
-      if (team == 1) {
-        cr = 255;
-        cg = 50;
-        cb = 50;
-      }
-      if (team == 2) {
-        cr = 50;
-        cg = 100;
-        cb = 255;
-      }
-
-      DrawBox(bx, by, bw, bh, cr, cg, cb, 200, 2);
-
-      // Draw player name + distance (gated by esp_label)
-      if (showLabels && boxHeight > 20.0f && g_pfnDrawSetTextColor &&
-          g_pfnDrawConsoleString) {
-
-        // Truncate name when far (small box)
-        if (boxHeight < 40.0f && strlen(playerName) > 8)
-          playerName[8] = '\0';
-        else if (boxHeight < 80.0f && strlen(playerName) > 15)
-          playerName[15] = '\0';
-
-        // Calculate distance (using cached local player pos)
-        float dist = 0;
-        if (localEnt) {
-          float dx = ox - localX, dy = oy - localY, dz = oz - localZ;
-          dist = sqrt(dx * dx + dy * dy + dz * dz);
+        // 2. Anti-Ghost Check + Get Player Name (reused for labels)
+        char playerName[32] = {0};
+        if (g_pfnGetPlayerInfo) {
+          hud_player_info_t info;
+          memset(&info, 0, sizeof(info));
+          g_pfnGetPlayerInfo(i, &info);
+          if (!info.name || !info.name[0])
+            continue; // Invalid/ghost player
+          strncpy(playerName, info.name, 31);
+          playerName[31] = '\0';
         }
 
-        // Calculate scaling based on distance (using box height)
-        // Box Height 100+ -> Scale 1.0
-        // Box Height 20 -> Scale 0.5
-        float scale = 1.0f;
-        if (boxHeight < 100.0f) {
-          scale = 0.5f + (boxHeight / 200.0f); // 0.5 ... 1.0 range approx
+        // 3. Get Entity Pointer (simple null check, no IsBadReadPtr)
+        void *ent = g_pfnGetEntityByIndex(i);
+        if (!ent)
+          continue;
+
+        // Check curstate.modelindex - skip dormant
+        int modelIdx = *(int *)((char *)ent + ESP_ORIGIN_OFFSET + 24);
+        if (modelIdx == 0)
+          continue;
+
+        float ox, oy, oz;
+        ReadOrigin(ent, ESP_ORIGIN_OFFSET, ox, oy, oz);
+        if (ox == 0.0f && oy == 0.0f && oz == 0.0f)
+          continue;
+
+        // Skip stale entities (dead, out of PVS/render distance)
+        // curstate.msg_time is at entity_state_t offset 8 = ESP_ORIGIN_OFFSET -
+        // 8
+        float entMsgTime = *(float *)((char *)ent + ESP_ORIGIN_OFFSET - 8);
+        if (entMsgTime > 0.0f && (time - entMsgTime) > 1.0f)
+          continue;
+
+        // GoldSrc origin is at player waist (center of hull)
+        float feetOrigin[3] = {ox, oy, oz - 36.0f};
+        float headOrigin[3] = {ox, oy, oz + 36.0f};
+        float feetX, feetY, headX, headY;
+
+        if (!W2S(feetOrigin, feetX, feetY, scrW, scrH))
+          continue;
+        if (!W2S(headOrigin, headX, headY, scrW, scrH))
+          continue;
+
+        float boxHeight = feetY - headY;
+        if (boxHeight < 4.0f)
+          continue;
+        if (boxHeight > scrH)
+          continue;
+        float boxWidth = boxHeight * 0.5f;
+
+        int bx = (int)(headX - boxWidth / 2.0f);
+        int by = (int)headY;
+        int bw = (int)boxWidth;
+        int bh = (int)boxHeight;
+
+        if (bx + bw < 0 || bx > scrW || by + bh < 0 || by > scrH)
+          continue;
+
+        // Color: Red for T, Blue for CT
+        int cr = 0, cg = 0, cb = 0;
+        if (team == 1) {
+          cr = 255;
+          cg = 50;
+          cb = 50;
         }
-        if (scale < 0.5f)
-          scale = 0.5f;
-        if (scale > 1.0f)
-          scale = 1.0f;
+        if (team == 2) {
+          cr = 50;
+          cg = 100;
+          cb = 255;
+        }
 
-        g_pfnDrawSetTextColor((float)cr / 255.0f, (float)cg / 255.0f,
-                              (float)cb / 255.0f);
-        char label[96];
-        sprintf(label, "%s [%.0fm]", playerName, dist / 40.0f);
+        DrawBox(bx, by, bw, bh, cr, cg, cb, 200, 2);
 
-        // Apply GL scaling
-        if (g_glMatrixMode && g_glPushMatrix && g_glPopMatrix && g_glScalef) {
-          int labelGap = (boxHeight > 60.0f) ? 14 : 10;
-          float drawX = (float)bx;
-          float drawY = (float)(by - labelGap);
+        // Draw player name + distance (gated by esp_label)
+        if (showLabels && boxHeight > 20.0f && g_pfnDrawSetTextColor &&
+            g_pfnDrawConsoleString) {
 
-          // To scale text "in place", we must scale coordinate system
-          // If we scale by 0.5, coordinates must be doubled to stay same screen
-          // pos
-          g_glMatrixMode(MY_GL_PROJECTION);
-          g_glPushMatrix();
-          g_glScalef(scale, scale, 1.0f);
+          // Truncate name when far (small box)
+          if (boxHeight < 40.0f && strlen(playerName) > 8)
+            playerName[8] = '\0';
+          else if (boxHeight < 80.0f && strlen(playerName) > 15)
+            playerName[15] = '\0';
 
-          g_pfnDrawConsoleString((int)(drawX / scale), (int)(drawY / scale),
-                                 label);
+          // Calculate distance (using cached local player pos)
+          float dist = 0;
+          if (localEnt) {
+            float dx = ox - localX, dy = oy - localY, dz = oz - localZ;
+            dist = sqrt(dx * dx + dy * dy + dz * dz);
+          }
 
-          g_glPopMatrix();
-        } else {
-          // Fallback no scaling
-          int labelGap = (boxHeight > 60.0f) ? 14 : 10;
-          g_pfnDrawConsoleString(bx, by - labelGap, label);
+          // Calculate scaling based on distance (using box height)
+          // Box Height 100+ -> Scale 1.0
+          // Box Height 20 -> Scale 0.5
+          float scale = 1.0f;
+          if (boxHeight < 100.0f) {
+            scale = 0.5f + (boxHeight / 200.0f); // 0.5 ... 1.0 range approx
+          }
+          if (scale < 0.5f)
+            scale = 0.5f;
+          if (scale > 1.0f)
+            scale = 1.0f;
+
+          g_pfnDrawSetTextColor((float)cr / 255.0f, (float)cg / 255.0f,
+                                (float)cb / 255.0f);
+          char label[96];
+          sprintf(label, "%s [%.0fm]", playerName, dist / 40.0f);
+
+          // Apply GL scaling
+          if (g_glMatrixMode && g_glPushMatrix && g_glPopMatrix && g_glScalef) {
+            int labelGap = (boxHeight > 60.0f) ? 14 : 10;
+            float drawX = (float)bx;
+            float drawY = (float)(by - labelGap);
+
+            // To scale text "in place", we must scale coordinate system
+            // If we scale by 0.5, coordinates must be doubled to stay same
+            // screen pos
+            g_glMatrixMode(MY_GL_PROJECTION);
+            g_glPushMatrix();
+            g_glScalef(scale, scale, 1.0f);
+
+            g_pfnDrawConsoleString((int)(drawX / scale), (int)(drawY / scale),
+                                   label);
+
+            g_glPopMatrix();
+          } else {
+            // Fallback no scaling
+            int labelGap = (boxHeight > 60.0f) ? 14 : 10;
+            g_pfnDrawConsoleString(bx, by - labelGap, label);
+          }
         }
       }
     }
@@ -1658,6 +2018,88 @@ void InstallHooks() {
   // Initialize Glow ESP (StudioDrawPlayer hook)
   InitGlowESP();
 
+  // Detour Core Sprite Engine functions (Inline Hook)
+  // TABLE HOOK Core Sprite Engine functions
+  if (g_EngineTable) {
+    LogDebug("[Hooks] Table Hooking SPR_Set, SPR_Draw...\n");
+    DWORD old;
+    if (VirtualProtect(g_EngineTable, 100 * 4, PAGE_READWRITE, &old)) {
+      g_Original_SPR_Set = (SPR_Set_t)g_EngineTable[4];
+      g_EngineTable[4] = (void *)Hook_SPR_Set;
+
+      g_Original_SPR_Draw = (SPR_Draw_t)g_EngineTable[5];
+      g_EngineTable[5] = (void *)Hook_SPR_Draw;
+
+      g_Original_SPR_DrawHoles = (SPR_DrawHoles_t)g_EngineTable[6];
+      g_EngineTable[6] = (void *)Hook_SPR_DrawHoles;
+
+      g_Original_SPR_DrawAdditive = (SPR_DrawAdditive_t)g_EngineTable[7];
+      g_EngineTable[7] = (void *)Hook_SPR_DrawAdditive;
+
+      VirtualProtect(g_EngineTable, 100 * 4, old, &old);
+      LogDebug("[NoSmoke] Core Sprite functions Table Hooked!\n");
+    }
+  }
+
+  // Pre-load smoke sprites and Detour R_TempSprite (Index 50)
+  // (Redundant lazy-load block removed)
+
+  // Force load smoke sprites NOW (don't wait for hooks)
+  EnsureSmokeModelsLoaded();
+
+  if (g_pEfxAPI) {
+    void **efxTable = (void **)g_pEfxAPI;
+
+    // Index 50: R_TempSprite
+    void *pTempSprite = efxTable[50];
+    if (pTempSprite) {
+      g_Original_R_TempSprite = (R_TempSprite_t)pTempSprite;
+      WriteJMP((DWORD)pTempSprite, (DWORD)Hook_R_TempSprite,
+               g_Orig_R_TempSprite, 5);
+      LogDebug("[NoSmoke] Detoured R_TempSprite @ 0x%X\n", (DWORD)pTempSprite);
+    }
+
+    // Index 55: R_ParticleExplosion
+    void *pPartExplosion = efxTable[55];
+    if (pPartExplosion) {
+      g_Original_R_ParticleExplosion = (R_ParticleExplosion_t)pPartExplosion;
+      WriteJMP((DWORD)pPartExplosion, (DWORD)Hook_R_ParticleExplosion,
+               g_Orig_R_ParticleExplosion, 5);
+      LogDebug("[NoSmoke] Detoured R_ParticleExplosion @ 0x%X\n",
+               (DWORD)pPartExplosion);
+    }
+
+    // Index 58: R_RocketTrail
+    void *pRocketTrail = efxTable[58];
+    if (pRocketTrail) {
+      g_Original_R_RocketTrail = (R_RocketTrail_t)pRocketTrail;
+      WriteJMP((DWORD)pRocketTrail, (DWORD)Hook_R_RocketTrail,
+               g_Orig_R_RocketTrail, 5);
+      LogDebug("[NoSmoke] Detoured R_RocketTrail @ 0x%X\n",
+               (DWORD)pRocketTrail);
+    }
+  }
+
+  // Hook SPR_Load (Table Hook) - Index 0
+  if (g_EngineTable && !g_Original_SPR_Load_Hook) {
+    g_pfnSPR_Load_Original = (SPR_Load_t)g_EngineTable[0];
+    DWORD old;
+    VirtualProtect(&g_EngineTable[0], 4, PAGE_READWRITE, &old);
+    g_EngineTable[0] = (void *)Hook_SPR_Load;
+    VirtualProtect(&g_EngineTable[0], 4, old, &old);
+    LogDebug("[NoSmoke] Table Hooked SPR_Load at index 0\n");
+    g_Original_SPR_Load_Hook = true;
+  }
+
+  // Re-patch smoke creation function (for F11 toggle back)
+  if (g_SmokeFuncAddr && g_SmokeFuncOrigByte) {
+    DWORD old;
+    VirtualProtect((void *)g_SmokeFuncAddr, 1, PAGE_EXECUTE_READWRITE, &old);
+    *(BYTE *)g_SmokeFuncAddr = 0xC3; // RET
+    VirtualProtect((void *)g_SmokeFuncAddr, 1, old, &old);
+    LogDebug("[NoSmoke] Smoke function re-patched -> RET!\n");
+  }
+
   g_HooksActive = true;
 }
 
@@ -1675,8 +2117,37 @@ void RemoveHooks() {
     Restore(g_GetVolumeInfo, g_Orig_Vol, 5);
   if (g_pfnConPrintf)
     Restore((DWORD)g_pfnConPrintf, g_Orig_ConPrintf, 6);
-  if (g_HUD_Redraw_Addr)
-    Restore(g_HUD_Redraw_Addr, g_Orig_HUD_Redraw, 6);
+
+  // Restore Core Sprite Engine functions
+  // Restore Core Sprite Engine functions
+  if (g_EngineTable) {
+    DWORD old;
+    if (VirtualProtect(g_EngineTable, 100 * 4, PAGE_READWRITE, &old)) {
+      if (g_Original_SPR_Set)
+        g_EngineTable[4] = (void *)g_Original_SPR_Set;
+      if (g_Original_SPR_Draw)
+        g_EngineTable[5] = (void *)g_Original_SPR_Draw;
+      if (g_Original_SPR_DrawHoles)
+        g_EngineTable[6] = (void *)g_Original_SPR_DrawHoles;
+      if (g_Original_SPR_DrawAdditive)
+        g_EngineTable[7] = (void *)g_Original_SPR_DrawAdditive;
+      VirtualProtect(g_EngineTable, 100 * 4, old, &old);
+      LogDebug("[NoSmoke] Core Sprite functions Restored\n");
+    }
+  }
+
+  if (g_Original_R_TempSprite) {
+    Restore((DWORD)g_Original_R_TempSprite, g_Orig_R_TempSprite, 5);
+  }
+
+  if (g_Original_R_ParticleExplosion) {
+    Restore((DWORD)g_Original_R_ParticleExplosion, g_Orig_R_ParticleExplosion,
+            5);
+  }
+  if (g_Original_R_RocketTrail) {
+    Restore((DWORD)g_Original_R_RocketTrail, g_Orig_R_RocketTrail, 5);
+  }
+  LogDebug("[NoSmoke] Restored EfxAPI hooks\n");
 
   // Restore DrawEngine CALL offset (CRITICAL - was missing before!)
   if (g_DrawEngineAddr) {
@@ -1705,6 +2176,15 @@ void RemoveHooks() {
     VirtualProtect(&g_pStudioInterface[2], 4, old, &old);
     g_GlowESP_Ready = false;
     LogDebug("[Glow] StudioDrawPlayer restored\n");
+  }
+
+  // Restore smoke creation function (no-smoke)
+  if (g_SmokeFuncAddr && g_SmokeFuncOrigByte) {
+    DWORD old;
+    VirtualProtect((void *)g_SmokeFuncAddr, 1, PAGE_EXECUTE_READWRITE, &old);
+    *(BYTE *)g_SmokeFuncAddr = g_SmokeFuncOrigByte;
+    VirtualProtect((void *)g_SmokeFuncAddr, 1, old, &old);
+    LogDebug("[NoSmoke] Smoke function restored\n");
   }
 
   g_HooksActive = false;
@@ -1856,6 +2336,8 @@ DWORD WINAPI MainThread(LPVOID) {
     g_RegisterCvar(&g_cvar_t_esp);
     g_RegisterCvar(&g_cvar_esp_type);
     g_RegisterCvar(&g_cvar_esp_label);
+    g_RegisterCvar(&g_cvar_sf_help);
+    g_RegisterCvar(&g_cvar_no_smoke);
   }
 
   InstallHooks();
@@ -1874,6 +2356,46 @@ DWORD WINAPI MainThread(LPVOID) {
     }
 
     if (g_HooksActive) {
+      // [NEW] sf_help logic
+      if (g_cvar_sf_help.value > 0.0f) {
+        if (g_pfnConPrintf) {
+          ((void (*)(const char *, ...))g_pfnConPrintf)("--- Commands ---\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  frame_skip <value>  - Skip frames (0=Off)\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  change_id <0/1>     - Toggle ID Changer\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  sf_help <0/1>       - Show Help Menu\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  sb <0/1>            - Toggle SayiBilen (1=Ready)\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  sb_range <N>        - Guess Range (Default: 100)\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  sb_delay <MS>       - Delay in ms (Default: 5)\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  esp_ct <0/1>        - Toggle CT ESP\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  esp_t <0/1>         - Toggle T ESP\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  esp_type <1/2/3>    - 1=Glow 2=Box 3=Both\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  esp_label <0/1>     - Toggle Name+Distance Labels\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  no_smoke <0/1>      - Toggle Smoke Removal\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  F11                 - Toggle Stealth (Freeze-Patch-Thaw)\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "--------------------\n");
+        }
+        // Reset to avoid spam
+        g_cvar_sf_help.value = 0.0f;
+      }
+
+      // Sync no_smoke cvar to global bool
+      if (g_cvar_no_smoke.string) {
+        g_NoSmoke = (atoi(g_cvar_no_smoke.string) > 0);
+      }
+
       if (g_cvar_frame_skip.string) {
         g_SkipVal = atoi(g_cvar_frame_skip.string);
       }
