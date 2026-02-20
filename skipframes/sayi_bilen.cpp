@@ -55,26 +55,18 @@ void SayiBilen_Stop() {
 }
 
 void NormalizeString(const char *input, char *output, int maxLen) {
-  int j = 0;
-  for (int i = 0; input[i] && j < maxLen - 1; i++) {
-    unsigned char c = (unsigned char)input[i];
-    if (c == 0xDC || c == 0xFC)
-      c = 'u';
-    else if (c == 0xDE || c == 0xFE || c == 0x5E)
-      c = 's';
-    else if (c == 0xDD || c == 0xFD)
-      c = 'i';
-    else if (c == 0xD6 || c == 0xF6)
-      c = 'o';
-    else if (c == 0xC7 || c == 0xE7)
-      c = 'c';
-    else if (c == 0xD0 || c == 0xF0)
-      c = 'g';
-    if (c >= 'A' && c <= 'Z')
-      c += 32;
-    output[j++] = (char)c;
+  int w = 0; // Write index
+  for (int r = 0; input[r] && w < maxLen - 1; r++) {
+    unsigned char c = (unsigned char)input[r];
+    
+    // Only do lowercase conversion for standard English letters
+    if (c >= 'A' && c <= 'Z') {
+      output[w++] = c + ('a' - 'A'); // Lowercase
+    } else {
+      output[w++] = (char)c; // Copy everything else exactly as it is
+    }
   }
-  output[j] = 0;
+  output[w] = 0; // Null terminate
 }
 
 void SayiBilen_OnMessage(const char *msg) {

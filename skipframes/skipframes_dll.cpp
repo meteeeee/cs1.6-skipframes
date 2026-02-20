@@ -287,62 +287,7 @@ typedef void (*UserMsg_t)(void *, void *, void *);
 UserMsg_t g_pfnUserMsg = nullptr;
 BYTE g_Orig_UserMsg[10];
 
-// Helper to normalize string (düşük -> dusuk) for keyword matching
-// Handles ANSI (CP1254) and UTF-8
-void QuickNormalize(char *str) {
-  if (!str)
-    return;
-  int w = 0; // Write index
-  for (int r = 0; str[r]; r++) {
-    unsigned char c = (unsigned char)str[r];
-    unsigned char next = (unsigned char)str[r + 1];
 
-    // UTF-8 Handling
-    if (c == 0xC3) { // UTF-8 Block 1
-      if (next == 0xBC || next == 0x9C)
-        str[w++] = 'u'; // ü, Ü
-      else if (next == 0xA7 || next == 0x87)
-        str[w++] = 'c'; // ç, Ç
-      else if (next == 0xB6 || next == 0x96)
-        str[w++] = 'o'; // ö, Ö
-      else
-        str[w++] = '?';
-      r++;                  // Skip next
-    } else if (c == 0xC4) { // UTF-8 Block 2
-      if (next == 0xB1 || next == 0xB0)
-        str[w++] = 'i'; // ı, İ (dotless i used as i)
-      else if (next == 0x9F || next == 0x9E)
-        str[w++] = 'g'; // ğ, Ğ
-      else
-        str[w++] = '?';
-      r++;                  // Skip next
-    } else if (c == 0xC5) { // UTF-8 Block 3
-      if (next == 0x9F || next == 0x9E)
-        str[w++] = 's'; // ş, Ş
-      else
-        str[w++] = '?';
-      r++; // Skip next
-    }
-    // ANSI / Standard Handling
-    else if (c >= 'A' && c <= 'Z')
-      str[w++] = c + ('a' - 'A'); // Lowercase
-    else if (c == 0xDC || c == 0xFC)
-      str[w++] = 'u'; // Ü, ü
-    else if (c == 0xC7 || c == 0xE7)
-      str[w++] = 'c'; // Ç, ç
-    else if (c == 0xD6 || c == 0xF6)
-      str[w++] = 'o'; // Ö, ö
-    else if (c == 0xDE || c == 0xFE)
-      str[w++] = 's'; // Ş, ş
-    else if (c == 0xD0 || c == 0xF0)
-      str[w++] = 'g'; // Ğ, ğ
-    else if (c == 0xDD || c == 0xFD)
-      str[w++] = 'i'; // İ, ı
-    else
-      str[w++] = (char)c;
-  }
-  str[w] = 0; // Null terminate new length
-}
 
 // [NEW] Con_Printf Hook
 typedef void (*ConPrintf_t)(const char *fmt, ...);
@@ -358,24 +303,7 @@ void Hook_ConPrintf(const char *fmt, void *a1, void *a2, void *a3) {
 
   // 2. Only process if SayiBilen is active (skip all work otherwise)
   if (g_SayiBilenActive && fmt) {
-    // Fast copy without per-byte IsBadReadPtr (was a major perf bottleneck)
-    char temp[512];
-    strncpy(temp, fmt, 511);
-    temp[511] = 0;
-    int len = strlen(temp);
-
-    // Only normalize if message is long enough to be chat
-    if (len > 5) {
-      char normalized[512];
-      strcpy(normalized, temp);
-      QuickNormalize(normalized);
-
-      if (strstr(normalized, "yuksek") || strstr(normalized, "dusuk") ||
-          strstr(normalized, "asagi") || strstr(normalized, "yukari") ||
-          strstr(normalized, "kucuk") || strstr(normalized, "buyuk")) {
-        SayiBilen_OnMessage(fmt);
-      }
-    }
+    SayiBilen_OnMessage(fmt);
   }
 
   // 3. Call Original
@@ -695,20 +623,7 @@ void __cdecl Hook_SPR_Set(int hPic, int r, int g, int b) {
   g_BlockCurrentSprite = false;
 
   // Lazy-load smoke sprites on first use
-  if (g_NumSmokeModels == 0 && g_pfnSPR_Load) {
-    const char *smokeSprites[] = {
-        "sprites/gas_puff_01.spr", "sprites/smokepuff.spr", "sprites/smoke.spr",
-        "sprites/black_smoke1.spr", "sprites/black_smoke4.spr"};
-    for (int i = 0; i < 5 && g_NumSmokeModels < MAX_SMOKE_MODELS; i++) {
-      int idx = g_pfnSPR_Load(smokeSprites[i]); // Safe (index 0 original ptr)
-      if (idx > 0) {
-        g_SmokeModelIndices[g_NumSmokeModels++] = idx;
-        LogDebug("[NoSmoke] Loaded %s -> handle %d\n", smokeSprites[i], idx);
-      }
-    }
-    if (g_NumSmokeModels == 0)
-      g_NumSmokeModels = -1;
-  }
+  EnsureSmokeModelsLoaded();
 
   // Debug Log
   static int sprSetLogCount = 0;
