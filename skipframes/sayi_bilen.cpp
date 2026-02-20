@@ -58,7 +58,7 @@ void NormalizeString(const char *input, char *output, int maxLen) {
   int w = 0; // Write index
   for (int r = 0; input[r] && w < maxLen - 1; r++) {
     unsigned char c = (unsigned char)input[r];
-    
+
     // Only do lowercase conversion for standard English letters
     if (c >= 'A' && c <= 'Z') {
       output[w++] = c + ('a' - 'A'); // Lowercase
@@ -101,6 +101,10 @@ void SayiBilen_OnMessage(const char *msg) {
 
   // Ignore ambiguous messages containing both directions
   if (isLow && isHigh)
+    return;
+
+  // Prevent glitch: Ignore feedback if the bot hasn't made its first guess yet
+  if (g_LastGuess == -99999)
     return;
 
   // Cooldown

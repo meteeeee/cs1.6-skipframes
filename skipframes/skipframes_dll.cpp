@@ -266,7 +266,6 @@ struct hud_player_info_t {
 };
 typedef void (*GetPlayerInfo_t)(int ent_num, hud_player_info_t *pinfo);
 GetPlayerInfo_t g_pfnGetPlayerInfo = nullptr;
-
 // -------------------------------------------------------------
 // HOOK TYPEDEFS
 // -------------------------------------------------------------
@@ -286,8 +285,6 @@ bool MemContains(void *ptr, int size, const char *str) {
 typedef void (*UserMsg_t)(void *, void *, void *);
 UserMsg_t g_pfnUserMsg = nullptr;
 BYTE g_Orig_UserMsg[10];
-
-
 
 // [NEW] Con_Printf Hook
 typedef void (*ConPrintf_t)(const char *fmt, ...);
@@ -420,7 +417,6 @@ R_Sprite_Explosion_t g_Original_R_Sprite_Explosion = nullptr;
 void __cdecl Hook_R_Sprite_Explosion(float *pos, int modelIndex, int count) {
   EnsureSmokeModelsLoaded();
 
-  // Debug Log
   static int logCount = 0;
   if (logCount < 10) {
     LogDebug("[R_Sprite_Explosion] modelIndex=%d count=%d\n", modelIndex,
@@ -436,11 +432,9 @@ void __cdecl Hook_R_Sprite_Explosion(float *pos, int modelIndex, int count) {
     }
   }
 
-  Restore((DWORD)g_Original_R_Sprite_Explosion, g_Orig_R_Sprite_Explosion, 5);
+  // Table hooked: Call original directly
   if (g_Original_R_Sprite_Explosion)
     g_Original_R_Sprite_Explosion(pos, modelIndex, count);
-  WriteJMP((DWORD)g_Original_R_Sprite_Explosion, (DWORD)Hook_R_Sprite_Explosion,
-           g_Orig_R_Sprite_Explosion, 5);
 }
 
 // --- Index 50: R_TempSprite (Existing) ---
@@ -459,18 +453,14 @@ R_ParticleExplosion_t g_Original_R_ParticleExplosion = nullptr;
 
 void __cdecl Hook_R_ParticleExplosion(float *org, int r, int g, int b,
                                       int style) {
-  // Just log for now
   static int logCount = 0;
   if (logCount < 10) {
     LogDebug("[R_ParticleExplosion] RGB=%d,%d,%d style=%d\n", r, g, b, style);
     logCount++;
   }
 
-  Restore((DWORD)g_Original_R_ParticleExplosion, g_Orig_R_ParticleExplosion, 5);
   if (g_Original_R_ParticleExplosion)
     g_Original_R_ParticleExplosion(org, r, g, b, style);
-  WriteJMP((DWORD)g_Original_R_ParticleExplosion,
-           (DWORD)Hook_R_ParticleExplosion, g_Orig_R_ParticleExplosion, 5);
 }
 
 // --- Index 58: R_RocketTrail ---
@@ -479,18 +469,14 @@ typedef void(__cdecl *R_RocketTrail_t)(float *start, float *end, int type);
 R_RocketTrail_t g_Original_R_RocketTrail = nullptr;
 
 void __cdecl Hook_R_RocketTrail(float *start, float *end, int type) {
-  // Just log
   static int logCount = 0;
   if (logCount < 10) {
     LogDebug("[R_RocketTrail] type=%d\n", type);
     logCount++;
   }
 
-  Restore((DWORD)g_Original_R_RocketTrail, g_Orig_R_RocketTrail, 5);
   if (g_Original_R_RocketTrail)
     g_Original_R_RocketTrail(start, end, type);
-  WriteJMP((DWORD)g_Original_R_RocketTrail, (DWORD)Hook_R_RocketTrail,
-           g_Orig_R_RocketTrail, 5);
 }
 
 void *__cdecl Hook_R_TempSprite(float *pos, float *dir, float scale,
@@ -547,17 +533,11 @@ void *__cdecl Hook_R_TempSprite(float *pos, float *dir, float scale,
     }
   }
 
-  // Restore & Call Original
-  Restore((DWORD)g_Original_R_TempSprite, g_Orig_R_TempSprite, 5);
-  void *ret = nullptr;
+  // Table hooked: Call original directly
   if (g_Original_R_TempSprite)
-    ret = g_Original_R_TempSprite(pos, dir, scale, modelIndex, rendermode,
-                                  renderfx, a, life, flags);
-
-  // Rehook
-  WriteJMP((DWORD)g_Original_R_TempSprite, (DWORD)Hook_R_TempSprite,
-           g_Orig_R_TempSprite, 5);
-  return ret;
+    return g_Original_R_TempSprite(pos, dir, scale, modelIndex, rendermode,
+                                   renderfx, a, life, flags);
+  return nullptr;
 }
 
 int __cdecl MsgFunc_SayText(const char *pszName, int iSize, void *pbuf) {
@@ -1566,23 +1546,18 @@ int __cdecl Hook_HUD_Redraw(float time, int intermission) {
     }
   }
 
-  // Call original HUD_Redraw (patch/unpatch method)
+  // Fast-Patch: Memory is kept unlocked. Swap bytes instantly.
   int ret = 0;
   if (g_HUD_Redraw_Addr) {
-    DWORD old;
-    VirtualProtect((void *)g_HUD_Redraw_Addr, 6, PAGE_EXECUTE_READWRITE, &old);
     memcpy((void *)g_HUD_Redraw_Addr, g_Orig_HUD_Redraw, 6);
-    VirtualProtect((void *)g_HUD_Redraw_Addr, 6, old, &old);
 
     ret = g_pfnHUD_Redraw(time, intermission);
 
-    VirtualProtect((void *)g_HUD_Redraw_Addr, 6, PAGE_EXECUTE_READWRITE, &old);
     BYTE patch[5] = {0xE9, 0, 0, 0, 0};
     *(DWORD *)(patch + 1) = (DWORD)Hook_HUD_Redraw - g_HUD_Redraw_Addr - 5;
     memcpy((void *)g_HUD_Redraw_Addr, patch, 5);
     if (6 > 5)
       memset((void *)(g_HUD_Redraw_Addr + 5), 0x90, 1);
-    VirtualProtect((void *)g_HUD_Redraw_Addr, 6, old, &old);
   }
 
   // ===== SAVE GL STATE before ESP drawing =====
@@ -1803,9 +1778,8 @@ extern "C" void Hook_SCR_Trampoline();
 __asm__(".intel_syntax noprefix\n"
         ".globl _Hook_SCR_Trampoline\n"
         "_Hook_SCR_Trampoline:\n"
-        "pushad\n"
-        "pushfd\n"
-        "call _SayiBilen_Update\n"
+        "push eax\n"
+        "push ecx\n"
         "mov eax, [_g_SkipVal]\n"
         "test eax, eax\n"
         "jz .L_run\n"
@@ -1815,6 +1789,11 @@ __asm__(".intel_syntax noprefix\n"
         "jg .L_skip\n"
         "mov [_g_FrameCount], eax\n"
         ".L_run:\n"
+        "pop ecx\n"
+        "pop eax\n"
+        "pushad\n"
+        "pushfd\n"
+        "call _SayiBilen_Update\n"
         "popfd\n"
         "popad\n"
         "push ebp\n"
@@ -1822,8 +1801,8 @@ __asm__(".intel_syntax noprefix\n"
         "sub esp, 0x10\n"
         "jmp DWORD PTR [_g_JmpTarget]\n"
         ".L_skip:\n"
-        "popfd\n"
-        "popad\n"
+        "pop ecx\n"
+        "pop eax\n"
         "ret\n"
         ".att_syntax\n");
 
@@ -1838,8 +1817,8 @@ void PatchByte(DWORD addr, BYTE val) {
 }
 
 void WriteJMP(DWORD from, DWORD to, BYTE *storage, int len) {
-  DWORD old;
-  VirtualProtect((void *)from, len, PAGE_EXECUTE_READWRITE, &old);
+  // Assume memory is ALREADY unprotected by caller if needed for persistent
+  // fast-patching
   bool empty = true;
   for (int i = 0; i < len; i++)
     if (storage[i])
@@ -1851,7 +1830,25 @@ void WriteJMP(DWORD from, DWORD to, BYTE *storage, int len) {
   memcpy((void *)from, patch, 5);
   if (len > 5)
     memset((void *)(from + 5), 0x90, len - 5);
-  VirtualProtect((void *)from, len, old, &old);
+}
+
+// Allocates executable memory, copies original bytes, and adds a JMP back
+void *CreateTrampoline(DWORD srcAddr, BYTE *origBytes, int len) {
+  // Allocate executable memory
+  void *tramp = VirtualAlloc(NULL, len + 5, MEM_COMMIT | MEM_RESERVE,
+                             PAGE_EXECUTE_READWRITE);
+  if (!tramp)
+    return nullptr;
+
+  // Copy stolen bytes to trampoline
+  memcpy(tramp, origBytes, len);
+
+  // Write JMP back to original function + len
+  BYTE jmp[5] = {0xE9, 0, 0, 0, 0};
+  *(DWORD *)(jmp + 1) = (srcAddr + len) - ((DWORD)tramp + len) - 5;
+  memcpy((BYTE *)tramp + len, jmp, 5);
+
+  return tramp;
 }
 
 void Restore(DWORD from, BYTE *storage, int len) {
@@ -1892,19 +1889,38 @@ void InstallHooks() {
     VirtualProtect((void *)(g_DrawEngineAddr + 1), 4, old, &old);
   }
 
-  if (g_SCR)
+  if (g_SCR) {
+    DWORD old;
+    VirtualProtect((void *)g_SCR, 6, PAGE_EXECUTE_READWRITE, &old);
     WriteJMP(g_SCR, (DWORD)Hook_SCR_Trampoline, g_Orig_SCR, 6);
-  if (g_CreateInterface)
+    VirtualProtect((void *)g_SCR, 6, old, &old);
+  }
+  if (g_CreateInterface) {
+    DWORD old;
+    VirtualProtect((void *)g_CreateInterface, 5, PAGE_EXECUTE_READWRITE, &old);
     WriteJMP(g_CreateInterface, (DWORD)Hook_CreateInterface, g_Orig_CI, 5);
-  if (g_SteamInternal)
+    VirtualProtect((void *)g_CreateInterface, 5, old, &old);
+  }
+  if (g_SteamInternal) {
+    DWORD old;
+    VirtualProtect((void *)g_SteamInternal, 5, PAGE_EXECUTE_READWRITE, &old);
     WriteJMP(g_SteamInternal, (DWORD)Hook_SteamInternal, g_Orig_SI, 5);
-  if (g_GetVolumeInfo)
+    VirtualProtect((void *)g_SteamInternal, 5, old, &old);
+  }
+  if (g_GetVolumeInfo) {
+    DWORD old;
+    VirtualProtect((void *)g_GetVolumeInfo, 5, PAGE_EXECUTE_READWRITE, &old);
     WriteJMP(g_GetVolumeInfo, (DWORD)Hook_GetVolInfo, g_Orig_Vol, 5);
+    VirtualProtect((void *)g_GetVolumeInfo, 5, old, &old);
+  }
 
   if (g_pfnConPrintf) {
     LogDebug("[Hooks] Installing ConPrintf hook at 0x%X -> 0x%X\n",
              (DWORD)g_pfnConPrintf, (DWORD)Hook_ConPrintf);
+    DWORD old;
+    VirtualProtect((void *)g_pfnConPrintf, 6, PAGE_EXECUTE_READWRITE, &old);
     WriteJMP((DWORD)g_pfnConPrintf, (DWORD)Hook_ConPrintf, g_Orig_ConPrintf, 6);
+    VirtualProtect((void *)g_pfnConPrintf, 6, old, &old);
   } else {
     LogDebug("[Hooks] WARNING: g_pfnConPrintf is NULL, skipping hook.\n");
   }
@@ -1925,9 +1941,12 @@ void InstallHooks() {
     }
   }
   if (g_HUD_Redraw_Addr) {
+    DWORD old;
+    // PERMANENT UNLOCK for Fast-Patching zero-overhead
+    VirtualProtect((void *)g_HUD_Redraw_Addr, 6, PAGE_EXECUTE_READWRITE, &old);
     WriteJMP(g_HUD_Redraw_Addr, (DWORD)Hook_HUD_Redraw, g_Orig_HUD_Redraw, 6);
-    LogDebug("[Hooks] HUD_Redraw hooked at 0x%X -> 0x%X\n", g_HUD_Redraw_Addr,
-             (DWORD)Hook_HUD_Redraw);
+    LogDebug("[Hooks] HUD_Redraw hooked at 0x%X -> 0x%X (Memory unlocked)\n",
+             g_HUD_Redraw_Addr, (DWORD)Hook_HUD_Redraw);
   }
 
   // Initialize Glow ESP (StudioDrawPlayer hook)
@@ -1965,33 +1984,36 @@ void InstallHooks() {
   if (g_pEfxAPI) {
     void **efxTable = (void **)g_pEfxAPI;
 
-    // Index 50: R_TempSprite
-    void *pTempSprite = efxTable[50];
-    if (pTempSprite) {
-      g_Original_R_TempSprite = (R_TempSprite_t)pTempSprite;
-      WriteJMP((DWORD)pTempSprite, (DWORD)Hook_R_TempSprite,
-               g_Orig_R_TempSprite, 5);
-      LogDebug("[NoSmoke] Detoured R_TempSprite @ 0x%X\n", (DWORD)pTempSprite);
-    }
+    DWORD oldEfx;
+    if (VirtualProtect(efxTable, 100 * 4, PAGE_READWRITE, &oldEfx)) {
+      // Index 50: R_TempSprite
+      if (efxTable[50]) {
+        g_Original_R_TempSprite = (R_TempSprite_t)efxTable[50];
+        efxTable[50] = (void *)Hook_R_TempSprite;
+        LogDebug("[NoSmoke] Table Hooked R_TempSprite\n");
+      }
 
-    // Index 55: R_ParticleExplosion
-    void *pPartExplosion = efxTable[55];
-    if (pPartExplosion) {
-      g_Original_R_ParticleExplosion = (R_ParticleExplosion_t)pPartExplosion;
-      WriteJMP((DWORD)pPartExplosion, (DWORD)Hook_R_ParticleExplosion,
-               g_Orig_R_ParticleExplosion, 5);
-      LogDebug("[NoSmoke] Detoured R_ParticleExplosion @ 0x%X\n",
-               (DWORD)pPartExplosion);
-    }
+      // Index 49: R_Sprite_Explosion
+      if (efxTable[49]) {
+        g_Original_R_Sprite_Explosion = (R_Sprite_Explosion_t)efxTable[49];
+        efxTable[49] = (void *)Hook_R_Sprite_Explosion;
+        LogDebug("[NoSmoke] Table Hooked R_Sprite_Explosion\n");
+      }
 
-    // Index 58: R_RocketTrail
-    void *pRocketTrail = efxTable[58];
-    if (pRocketTrail) {
-      g_Original_R_RocketTrail = (R_RocketTrail_t)pRocketTrail;
-      WriteJMP((DWORD)pRocketTrail, (DWORD)Hook_R_RocketTrail,
-               g_Orig_R_RocketTrail, 5);
-      LogDebug("[NoSmoke] Detoured R_RocketTrail @ 0x%X\n",
-               (DWORD)pRocketTrail);
+      // Index 55: R_ParticleExplosion
+      if (efxTable[55]) {
+        g_Original_R_ParticleExplosion = (R_ParticleExplosion_t)efxTable[55];
+        efxTable[55] = (void *)Hook_R_ParticleExplosion;
+        LogDebug("[NoSmoke] Table Hooked R_ParticleExplosion\n");
+      }
+
+      // Index 58: R_RocketTrail
+      if (efxTable[58]) {
+        g_Original_R_RocketTrail = (R_RocketTrail_t)efxTable[58];
+        efxTable[58] = (void *)Hook_R_RocketTrail;
+        LogDebug("[NoSmoke] Table Hooked R_RocketTrail\n");
+      }
+      VirtualProtect(efxTable, 100 * 4, oldEfx, &oldEfx);
     }
   }
 
@@ -2051,20 +2073,28 @@ void RemoveHooks() {
     }
   }
 
-  if (g_Original_R_TempSprite) {
-    Restore((DWORD)g_Original_R_TempSprite, g_Orig_R_TempSprite, 5);
+  if (g_pEfxAPI) {
+    void **efxTable = (void **)g_pEfxAPI;
+    DWORD oldEfx;
+    if (VirtualProtect(efxTable, 100 * 4, PAGE_READWRITE, &oldEfx)) {
+      if (g_Original_R_TempSprite)
+        efxTable[50] = (void *)g_Original_R_TempSprite;
+      if (g_Original_R_Sprite_Explosion)
+        efxTable[49] = (void *)g_Original_R_Sprite_Explosion;
+      if (g_Original_R_ParticleExplosion)
+        efxTable[55] = (void *)g_Original_R_ParticleExplosion;
+      if (g_Original_R_RocketTrail)
+        efxTable[58] = (void *)g_Original_R_RocketTrail;
+      VirtualProtect(efxTable, 100 * 4, oldEfx, &oldEfx);
+    }
+    LogDebug("[NoSmoke] Restored EfxAPI table hooks\n");
   }
-
-  if (g_Original_R_ParticleExplosion) {
-    Restore((DWORD)g_Original_R_ParticleExplosion, g_Orig_R_ParticleExplosion,
-            5);
-  }
-  if (g_Original_R_RocketTrail) {
-    Restore((DWORD)g_Original_R_RocketTrail, g_Orig_R_RocketTrail, 5);
-  }
-  LogDebug("[NoSmoke] Restored EfxAPI hooks\n");
 
   // Restore DrawEngine CALL offset (CRITICAL - was missing before!)
+  if (g_HUD_Redraw_Addr && g_Orig_HUD_Redraw[0] != 0) {
+    Restore(g_HUD_Redraw_Addr, g_Orig_HUD_Redraw, 6);
+  }
+
   if (g_DrawEngineAddr) {
     DWORD old;
     VirtualProtect((void *)(g_DrawEngineAddr + 1), 4, PAGE_EXECUTE_READWRITE,
