@@ -146,7 +146,7 @@ int main() {
 
   char tempPath[MAX_PATH];
   GetTempPathA(MAX_PATH, tempPath);
-  strcat(tempPath, "skipframes-v1.5.1.dll");
+  strcat(tempPath, "skipframes-v1.5.2.dll");
 
   // 1. Drop DLL
   if (!DropFile(tempPath, g_DllData, g_DllSize)) {
@@ -173,6 +173,7 @@ int main() {
     Log("  no_scope <0/1>      - Draw crosshair for Sniper Rifles\n");
     Log("  speedometer <0/1>   - Toggle Speedometer\n");
     Log("  speedometer_color   - RGB string (e.g., \"0 255 255\")\n");
+    Log("  showfps <0/1>       - Toggle Real FPS Counter\n");
     Log("  F11                 - Toggle Stealth (Freeze-Patch-Thaw)\n");
     Log("--------------------\n");
   } else {

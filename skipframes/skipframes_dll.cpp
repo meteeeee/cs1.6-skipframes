@@ -85,6 +85,7 @@ cvar_t g_cvar_t_esp = {"esp_t", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_esp_type = {"esp_type", "3", 0, 0.0f,
                           nullptr}; // 1=Glow, 2=Box, 3=Both
 cvar_t g_cvar_esp_label = {"esp_label", "0", 0, 0.0f, nullptr}; // 1=show labels
+cvar_t g_cvar_showfps = {"showfps", "1", 0, 0.0f, nullptr};
 // [NEW] Help Command
 cvar_t g_cvar_sf_help = {"sf_help", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_no_smoke = {"no_smoke", "1", 0, 1.0f, nullptr};
@@ -256,6 +257,14 @@ struct SCREENINFO {
 };
 typedef void (*GetScreenInfo_t)(SCREENINFO *pscrinfo);
 GetScreenInfo_t g_pfnGetScreenInfo = nullptr;
+int g_ScrWidth = 0;
+int g_ScrHeight = 0;
+
+// [NEW] FPS Counter Globals
+extern "C" volatile int g_SkipVal;
+float g_RealFPS = 0.0f;
+int g_FPSFrameCount = 0;
+DWORD g_LastFPSUpdateTime = 0;
 
 // Player info for ESP names
 struct hud_player_info_t {
@@ -1582,6 +1591,29 @@ int __cdecl Hook_DrawEngine() {
 
 // ===== HUD_REDRAW HOOK (ESP drawing happens here, after 3D world) =====
 int __cdecl Hook_HUD_Redraw(float time, int intermission) {
+  // --- REAL FPS CALCULATION ---
+  DWORD curTime = GetTickCount();
+  if (g_LastFPSUpdateTime == 0) {
+    g_LastFPSUpdateTime = curTime;
+  }
+  DWORD elapsed = curTime - g_LastFPSUpdateTime;
+  if (elapsed >= 1000) {
+    g_RealFPS = (float)g_FPSFrameCount * 1000.0f / (float)elapsed;
+    g_FPSFrameCount = 0;
+    g_LastFPSUpdateTime = curTime;
+  }
+
+  // --- REAL FPS DISPLAY (TOP LEFT) ---
+  if (g_cvar_showfps.value != 0.0f && g_pfnDrawConsoleString &&
+      g_pfnDrawSetTextColor) {
+    char fpsText[32];
+    sprintf(fpsText, "FPS: %d", (int)g_RealFPS);
+
+    // Default bright yellow/green for visibility
+    g_pfnDrawSetTextColor(0.5f, 1.0f, 0.0f);
+    g_pfnDrawConsoleString(10, 10, fpsText);
+  }
+
   // Auto-rehook safety checks (Fixes Alt-Tab zero-speed bug caused by engine
   // exceptions)
   if (g_HooksActive) {
@@ -1939,6 +1971,7 @@ extern "C" void Hook_SCR_Trampoline();
 __asm__(".intel_syntax noprefix\n"
         ".globl _Hook_SCR_Trampoline\n"
         "_Hook_SCR_Trampoline:\n"
+        "inc dword ptr [_g_FPSFrameCount]\n"
         "push eax\n"
         "push ecx\n"
         "mov eax, [_g_SkipVal]\n"
@@ -2481,6 +2514,7 @@ DWORD WINAPI MainThread(LPVOID) {
     g_RegisterCvar(&g_cvar_no_scope);
     g_RegisterCvar(&g_cvar_speedometer);
     g_RegisterCvar(&g_cvar_speedometer_color);
+    g_RegisterCvar(&g_cvar_showfps);
   }
 
   InstallHooks();
@@ -2531,6 +2565,8 @@ DWORD WINAPI MainThread(LPVOID) {
               "  speedometer <0/1>   - Toggle Speedometer\n");
           ((void (*)(const char *, ...))g_pfnConPrintf)(
               "  speedometer_color   - RGB color (e.g., \"0 255 255\")\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  showfps <0/1>       - Toggle Real FPS Counter\n");
           ((void (*)(const char *, ...))g_pfnConPrintf)(
               "  F11                 - Toggle Stealth (Freeze-Patch-Thaw)\n");
           ((void (*)(const char *, ...))g_pfnConPrintf)(
