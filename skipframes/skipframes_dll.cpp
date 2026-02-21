@@ -88,6 +88,7 @@ cvar_t g_cvar_esp_label = {"esp_label", "0", 0, 0.0f, nullptr}; // 1=show labels
 // [NEW] Help Command
 cvar_t g_cvar_sf_help = {"sf_help", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_no_smoke = {"no_smoke", "1", 0, 1.0f, nullptr};
+cvar_t g_cvar_no_scope = {"no_scope", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_speedometer = {"speedometer", "1", 0, 1.0f, nullptr};
 cvar_t g_cvar_speedometer_color = {"speedometer_color", "0 255 255", 0, 0.0f,
                                    nullptr};
@@ -1581,6 +1582,24 @@ int __cdecl Hook_DrawEngine() {
 
 // ===== HUD_REDRAW HOOK (ESP drawing happens here, after 3D world) =====
 int __cdecl Hook_HUD_Redraw(float time, int intermission) {
+  // Auto-rehook safety checks (Fixes Alt-Tab zero-speed bug caused by engine
+  // exceptions)
+  if (g_HooksActive) {
+    if (g_HUD_PlayerMove_Addr && *(BYTE *)g_HUD_PlayerMove_Addr != 0xE9) {
+      BYTE patch[5] = {0xE9, 0, 0, 0, 0};
+      *(DWORD *)(patch + 1) =
+          (DWORD)Hook_HUD_PlayerMove - (DWORD)g_HUD_PlayerMove_Addr - 5;
+      memcpy((void *)g_HUD_PlayerMove_Addr, patch, 5);
+      *(BYTE *)((DWORD)g_HUD_PlayerMove_Addr + 5) = 0x90;
+    }
+    if (g_pfnConPrintf && *(BYTE *)g_pfnConPrintf != 0xE9) {
+      BYTE patch[5] = {0xE9, 0, 0, 0, 0};
+      *(DWORD *)(patch + 1) = (DWORD)Hook_ConPrintf - (DWORD)g_pfnConPrintf - 5;
+      memcpy((void *)g_pfnConPrintf, patch, 5);
+      *(BYTE *)((DWORD)g_pfnConPrintf + 5) = 0x90;
+    }
+  }
+
   // Ensure GL functions are loaded (needed for state management)
   static bool glLoaded = false;
   if (!glLoaded) {
@@ -1829,7 +1848,7 @@ int __cdecl Hook_HUD_Redraw(float time, int intermission) {
           // Servers do NOT use EMA math. They just blast the raw instantaneous
           // float onto the HUD every 0.1s. By updating instantly, we erase the
           // 0.3s temporal trailing delay completely!
-          if (time - lastDisplayTime >= 0.1f) {
+          if (time - lastDisplayTime >= 0.1f || time < lastDisplayTime) {
             displayedTextSpeed = engineSpeed;
             if (displayedTextSpeed < 1.0f)
               displayedTextSpeed = 0.0f;
@@ -1863,6 +1882,28 @@ int __cdecl Hook_HUD_Redraw(float time, int intermission) {
             }
             g_pfnDrawConsoleString(drawX, drawY, speedText);
           }
+        }
+      }
+    }
+
+    // --- NO SCOPE CROSSHAIR ---
+    if (g_cvar_no_scope.value != 0.0f) {
+      if (g_pfnGetScreenInfo && g_pfnFillRGBA) {
+        SCREENINFO scr = {0};
+        scr.iSize = sizeof(SCREENINFO);
+        g_pfnGetScreenInfo(&scr);
+        if (scr.iWidth > 0 && scr.iHeight > 0) {
+          int cx = scr.iWidth / 2;
+          int cy = scr.iHeight / 2;
+          int r = 0, g = 255, b = 0, a = 255; // Bright Green
+
+          // Draw a small '+' crosshair
+          int length = 5;
+          int thick = 2;
+          g_pfnFillRGBA(cx - length, cy - (thick / 2), length * 2, thick, r, g,
+                        b, a); // Horizontal
+          g_pfnFillRGBA(cx - (thick / 2), cy - length, thick, length * 2, r, g,
+                        b, a); // Vertical
         }
       }
     }
@@ -2437,6 +2478,7 @@ DWORD WINAPI MainThread(LPVOID) {
     g_RegisterCvar(&g_cvar_esp_label);
     g_RegisterCvar(&g_cvar_sf_help);
     g_RegisterCvar(&g_cvar_no_smoke);
+    g_RegisterCvar(&g_cvar_no_scope);
     g_RegisterCvar(&g_cvar_speedometer);
     g_RegisterCvar(&g_cvar_speedometer_color);
   }
@@ -2483,6 +2525,8 @@ DWORD WINAPI MainThread(LPVOID) {
               "  esp_label <0/1>     - Toggle Name+Distance Labels\n");
           ((void (*)(const char *, ...))g_pfnConPrintf)(
               "  no_smoke <0/1>      - Toggle Smoke Removal\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  no_scope <0/1>      - Draw crosshair for Sniper Rifles\n");
           ((void (*)(const char *, ...))g_pfnConPrintf)(
               "  speedometer <0/1>   - Toggle Speedometer\n");
           ((void (*)(const char *, ...))g_pfnConPrintf)(
