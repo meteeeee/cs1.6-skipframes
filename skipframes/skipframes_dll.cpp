@@ -88,6 +88,9 @@ cvar_t g_cvar_esp_label = {"esp_label", "0", 0, 0.0f, nullptr}; // 1=show labels
 // [NEW] Help Command
 cvar_t g_cvar_sf_help = {"sf_help", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_no_smoke = {"no_smoke", "1", 0, 1.0f, nullptr};
+cvar_t g_cvar_speedometer = {"speedometer", "1", 0, 1.0f, nullptr};
+cvar_t g_cvar_speedometer_color = {"speedometer_color", "0 255 255", 0, 0.0f,
+                                   nullptr};
 
 // ESP Globals
 int g_PlayerTeam[33] = {0}; // 0=Unknown, 1=T, 2=CT
@@ -266,6 +269,46 @@ struct hud_player_info_t {
 };
 typedef void (*GetPlayerInfo_t)(int ent_num, hud_player_info_t *pinfo);
 GetPlayerInfo_t g_pfnGetPlayerInfo = nullptr;
+
+// Minimal entity state for reading velocity
+struct entity_state_t {
+  int entityType;
+  int number;
+  float msg_time;
+  int messagenum;
+  float origin[3];
+  float angles[3];
+  int modelindex;
+  int sequence;
+  float frame;
+  int colormap;
+  short skin;
+  short solid;
+  int effects;
+  float scale;
+  BYTE eflags;
+  int rendermode;
+  int renderamt;
+  int rendercolor;
+  int renderfx;
+  int movetype;
+  float animtime;
+  float framerate;
+  int body;
+  BYTE controller[4];
+  BYTE blending[4];
+  float velocity[3];
+};
+
+struct cl_entity_t {
+  int index;
+  BYTE bUnknown[20]; // internal padding prefix
+  void *model;
+  void *epuzzle;
+  float baseline[10];      // approximate size
+  entity_state_t curstate; // Velocity is at the end of this struct
+};
+
 // -------------------------------------------------------------
 // HOOK TYPEDEFS
 // -------------------------------------------------------------
@@ -291,12 +334,39 @@ typedef void (*ConPrintf_t)(const char *fmt, ...);
 ConPrintf_t g_pfnConPrintf = nullptr;
 BYTE g_Orig_ConPrintf[10];
 
+// [NEW] HUD_PlayerMove Hook (for perfect instantaneous velocity)
+typedef void (*HUD_PlayerMove_t)(void *ppmove, int server);
+HUD_PlayerMove_t g_Original_HUD_PlayerMove = nullptr;
+DWORD g_HUD_PlayerMove_Addr = 0;
+BYTE g_Orig_HUD_PlayerMove[10];
+float g_TrueEngineVelocity[3] = {0.0f, 0.0f, 0.0f};
+
+void Hook_HUD_PlayerMove(void *ppmove, int server) {
+  // Fast-Patch: Memory is kept unlocked. Swap bytes instantly.
+  memcpy((void *)g_HUD_PlayerMove_Addr, g_Orig_HUD_PlayerMove, 6);
+
+  ((HUD_PlayerMove_t)g_HUD_PlayerMove_Addr)(ppmove, server);
+
+  // Now that the engine has calculated the perfect physics velocity, we SNATCH
+  // it! This completely eliminates all 1000 FPS lag, delays, and spinning
+  // decimals.
+  if (ppmove && !IsBadReadPtr(ppmove, 128)) {
+    g_TrueEngineVelocity[0] = *(float *)((char *)ppmove + 92);
+    g_TrueEngineVelocity[1] = *(float *)((char *)ppmove + 96);
+    g_TrueEngineVelocity[2] = *(float *)((char *)ppmove + 100);
+  }
+
+  // Hook back IN
+  BYTE patch[5] = {0xE9, 0, 0, 0, 0};
+  *(DWORD *)(patch + 1) =
+      (DWORD)Hook_HUD_PlayerMove - (DWORD)g_HUD_PlayerMove_Addr - 5;
+  memcpy((void *)g_HUD_PlayerMove_Addr, patch, 5);
+  *(BYTE *)((DWORD)g_HUD_PlayerMove_Addr + 5) = 0x90; // NOP
+}
+
 void Hook_ConPrintf(const char *fmt, void *a1, void *a2, void *a3) {
-  // 1. Unhook
-  DWORD old;
-  VirtualProtect((void *)g_pfnConPrintf, 6, PAGE_EXECUTE_READWRITE, &old);
+  // 1. Unhook (Fast-Patch: Memory is kept permanently unlocked)
   memcpy((void *)g_pfnConPrintf, g_Orig_ConPrintf, 6);
-  VirtualProtect((void *)g_pfnConPrintf, 6, old, &old);
 
   // 2. Only process if SayiBilen is active (skip all work otherwise)
   if (g_SayiBilenActive && fmt) {
@@ -309,10 +379,8 @@ void Hook_ConPrintf(const char *fmt, void *a1, void *a2, void *a3) {
   // 4. Rehook
   BYTE patch[5] = {0xE9, 0, 0, 0, 0};
   *(DWORD *)(patch + 1) = (DWORD)Hook_ConPrintf - (DWORD)g_pfnConPrintf - 5;
-  VirtualProtect((void *)g_pfnConPrintf, 6, PAGE_EXECUTE_READWRITE, &old);
   memcpy((void *)g_pfnConPrintf, patch, 5);
   *(BYTE *)((DWORD)g_pfnConPrintf + 5) = 0x90;
-  VirtualProtect((void *)g_pfnConPrintf, 6, old, &old);
 }
 
 // -------------------------------------------------------------
@@ -387,8 +455,8 @@ void *g_pEfxAPI = nullptr;
 
 // Helper: Lazy-load smoke sprites
 void EnsureSmokeModelsLoaded() {
-  LogDebug("[NoSmoke] EnsureSmokeModelsLoaded() called (Count=%d)\n",
-           g_NumSmokeModels);
+  // LogDebug("[NoSmoke] EnsureSmokeModelsLoaded() called (Count=%d)\n",
+  // g_NumSmokeModels);
   if (g_NumSmokeModels <= 0 && g_pfnSPR_Load) {
     static bool triedLoading = false;
     if (!triedLoading) {
@@ -1507,7 +1575,7 @@ int __cdecl Hook_DrawEngine() {
   if (g_Original_DrawEngine) {
     ret = g_Original_DrawEngine();
   }
-  // ESP drawing moved to Hook_HUD_Redraw (fires after 3D scene)
+  // ESP drawing moved to Hook_HUD_Redraw (fires after 3D world renders)
   return ret;
 }
 
@@ -1689,9 +1757,9 @@ int __cdecl Hook_HUD_Redraw(float time, int intermission) {
             g_pfnDrawConsoleString) {
 
           // Truncate name when far (small box)
-          if (boxHeight < 40.0f && strlen(playerName) > 8)
+          if (boxHeight < 100.0f && strlen(playerName) > 8)
             playerName[8] = '\0';
-          else if (boxHeight < 80.0f && strlen(playerName) > 15)
+          else if (boxHeight < 150.0f && strlen(playerName) > 15)
             playerName[15] = '\0';
 
           // Calculate distance (using cached local player pos)
@@ -1743,6 +1811,61 @@ int __cdecl Hook_HUD_Redraw(float time, int intermission) {
         }
       }
     }
+
+    // --- SPEEDOMETER ---
+    if (g_cvar_speedometer.value != 0.0f) {
+      if (g_pfnGetLocalPlayer && g_pfnDrawSetTextColor &&
+          g_pfnDrawConsoleString) {
+        cl_entity_t *pLocal = (cl_entity_t *)g_pfnGetLocalPlayer();
+        if (pLocal && !IsBadReadPtr(pLocal, sizeof(cl_entity_t))) {
+          // Uses identical float readout from the POST-simulation physics hook!
+          float engineSpeed =
+              sqrtf((g_TrueEngineVelocity[0] * g_TrueEngineVelocity[0]) +
+                    (g_TrueEngineVelocity[1] * g_TrueEngineVelocity[1]));
+
+          static float displayedTextSpeed = 0.0f;
+          static float lastDisplayTime = 0.0f;
+
+          // Servers do NOT use EMA math. They just blast the raw instantaneous
+          // float onto the HUD every 0.1s. By updating instantly, we erase the
+          // 0.3s temporal trailing delay completely!
+          if (time - lastDisplayTime >= 0.1f) {
+            displayedTextSpeed = engineSpeed;
+            if (displayedTextSpeed < 1.0f)
+              displayedTextSpeed = 0.0f;
+            lastDisplayTime = time;
+          }
+
+          // Only draw if we actually have a valid reading
+          if (displayedTextSpeed >= 0.0f && displayedTextSpeed < 4000.0f) {
+            char speedText[32];
+            sprintf(speedText, "Speed: %.2f", displayedTextSpeed);
+
+            // Fetch custom RGB color from CVar
+            int cr = 0, cg = 255, cb = 255; // Default: Cyan
+            if (g_cvar_speedometer_color.string) {
+              sscanf(g_cvar_speedometer_color.string, "%d %d %d", &cr, &cg,
+                     &cb);
+            }
+            g_pfnDrawSetTextColor((float)cr / 255.0f, (float)cg / 255.0f,
+                                  (float)cb / 255.0f);
+
+            int drawX = 400;
+            int drawY = 500;
+            if (g_pfnGetScreenInfo) {
+              SCREENINFO scr = {0};
+              scr.iSize = sizeof(SCREENINFO);
+              g_pfnGetScreenInfo(&scr);
+              if (scr.iWidth > 0 && scr.iHeight > 0) {
+                drawX = scr.iWidth / 2 - 40;
+                drawY = scr.iHeight - 100;
+              }
+            }
+            g_pfnDrawConsoleString(drawX, drawY, speedText);
+          }
+        }
+      }
+    }
   }
 
   // ===== RESTORE ALL GL STATE after ESP drawing =====
@@ -1753,15 +1876,12 @@ int __cdecl Hook_HUD_Redraw(float time, int intermission) {
 }
 
 DWORD FindEngineDraw() {
-  // Pattern from user: 90 E8 ...
-  // "\x90\xE8\x00\x00\x00\x00\x85\xC0\x74\x00\xE8", "xx????xxx?x"
-  // Wait, FindPattern takes signature and mask.
   const char *sig = "\x90\xE8\x00\x00\x00\x00\x85\xC0\x74\x00\xE8";
   const char *mask = "xx????xxx?x";
 
   DWORD addr = FindPattern(g_HwBase, 0x1200000, sig, mask);
   if (addr) {
-    return addr + 1; // +1 to skip NOP? 90 is NOP. E8 is CALL.
+    return addr + 1;
   }
   return 0;
 }
@@ -1866,6 +1986,39 @@ void InstallHooks() {
 
   PatchByte(g_HwBase + OFF_CMD_PATCH, 0xEB);
 
+  // Independent HUD_PlayerMove Hooking to avoid the 20s HUD_Redraw dependency
+  // delay
+  if (!g_HUD_PlayerMove_Addr) {
+    HMODULE hClient = GetModuleHandleA("client.dll");
+    if (hClient) {
+      HUD_PlayerMove_t pfnPMove =
+          (HUD_PlayerMove_t)GetProcAddress(hClient, "HUD_PlayerMove");
+      if (!pfnPMove)
+        pfnPMove =
+            (HUD_PlayerMove_t)GetProcAddress(hClient, "_HUD_PlayerMove@8");
+
+      if (pfnPMove) {
+        g_HUD_PlayerMove_Addr = (DWORD)pfnPMove;
+        LogDebug("[Hooks] Found HUD_PlayerMove at 0x%X\n",
+                 g_HUD_PlayerMove_Addr);
+
+        // PERMANENT UNLOCK for Fast-Patching zero-overhead
+        DWORD old;
+        VirtualProtect((void *)g_HUD_PlayerMove_Addr, 6, PAGE_EXECUTE_READWRITE,
+                       &old);
+        memcpy(g_Orig_HUD_PlayerMove, (void *)g_HUD_PlayerMove_Addr, 6);
+
+        BYTE patch[5] = {0xE9, 0, 0, 0, 0};
+        *(DWORD *)(patch + 1) =
+            (DWORD)Hook_HUD_PlayerMove - (DWORD)g_HUD_PlayerMove_Addr - 5;
+        memcpy((void *)g_HUD_PlayerMove_Addr, patch, 5);
+        *(BYTE *)((DWORD)g_HUD_PlayerMove_Addr + 5) = 0x90; // NOP
+        LogDebug(
+            "[Hooks] HUD_PlayerMove Hooked successfully (Memory unlocked)!\n");
+      }
+    }
+  }
+
   // Install DrawEngine Hook (cached - only scan once)
   if (!g_DrawEngineAddr) {
     g_DrawEngineAddr = FindEngineDraw();
@@ -1917,10 +2070,11 @@ void InstallHooks() {
   if (g_pfnConPrintf) {
     LogDebug("[Hooks] Installing ConPrintf hook at 0x%X -> 0x%X\n",
              (DWORD)g_pfnConPrintf, (DWORD)Hook_ConPrintf);
+    // PERMANENT UNLOCK for Fast-Patching zero-overhead
     DWORD old;
     VirtualProtect((void *)g_pfnConPrintf, 6, PAGE_EXECUTE_READWRITE, &old);
     WriteJMP((DWORD)g_pfnConPrintf, (DWORD)Hook_ConPrintf, g_Orig_ConPrintf, 6);
-    VirtualProtect((void *)g_pfnConPrintf, 6, old, &old);
+    LogDebug("[Hooks] ConPrintf Hooked successfully (Memory unlocked)!\n");
   } else {
     LogDebug("[Hooks] WARNING: g_pfnConPrintf is NULL, skipping hook.\n");
   }
@@ -2283,6 +2437,8 @@ DWORD WINAPI MainThread(LPVOID) {
     g_RegisterCvar(&g_cvar_esp_label);
     g_RegisterCvar(&g_cvar_sf_help);
     g_RegisterCvar(&g_cvar_no_smoke);
+    g_RegisterCvar(&g_cvar_speedometer);
+    g_RegisterCvar(&g_cvar_speedometer_color);
   }
 
   InstallHooks();
@@ -2327,6 +2483,10 @@ DWORD WINAPI MainThread(LPVOID) {
               "  esp_label <0/1>     - Toggle Name+Distance Labels\n");
           ((void (*)(const char *, ...))g_pfnConPrintf)(
               "  no_smoke <0/1>      - Toggle Smoke Removal\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  speedometer <0/1>   - Toggle Speedometer\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  speedometer_color   - RGB color (e.g., \"0 255 255\")\n");
           ((void (*)(const char *, ...))g_pfnConPrintf)(
               "  F11                 - Toggle Stealth (Freeze-Patch-Thaw)\n");
           ((void (*)(const char *, ...))g_pfnConPrintf)(

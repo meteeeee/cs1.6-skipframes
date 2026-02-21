@@ -170,6 +170,8 @@ int main() {
     Log("  esp_type <1/2/3>    - 1=Glow 2=Box 3=Both\n");
     Log("  esp_label <0/1>     - Toggle Name+Distance Labels\n");
     Log("  no_smoke <0/1>      - Toggle Smoke Removal\n");
+    Log("  speedometer <0/1>   - Toggle Speedometer\n");
+    Log("  speedometer_color   - RGB string (e.g., \"0 255 255\")\n");
     Log("  F11                 - Toggle Stealth (Freeze-Patch-Thaw)\n");
     Log("--------------------\n");
   } else {
