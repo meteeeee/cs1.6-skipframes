@@ -86,13 +86,22 @@ cvar_t g_cvar_esp_type = {"esp_type", "3", 0, 0.0f,
                           nullptr}; // 1=Glow, 2=Box, 3=Both
 cvar_t g_cvar_esp_label = {"esp_label", "0", 0, 0.0f, nullptr}; // 1=show labels
 cvar_t g_cvar_showfps = {"showfps", "1", 0, 0.0f, nullptr};
+// [NEW] Custom Crosshair
+cvar_t g_cvar_ch = {"ch", "1", 0, 0.0f, nullptr};
+cvar_t g_cvar_ch_color = {"ch_color", "0 255 255", 0, 0.0f, nullptr};
+cvar_t g_cvar_ch_length = {"ch_length", "6", 0, 0.0f, nullptr};
+cvar_t g_cvar_ch_offset = {"ch_offset", "4", 0, 0.0f, nullptr};
+cvar_t g_cvar_ch_thickness = {"ch_thickness", "1", 0, 0.0f, nullptr};
+cvar_t g_cvar_ch_import = {"ch_import", "", 0, 0.0f, nullptr};
+cvar_t g_cvar_ch_export = {"ch_export", "", 0, 0.0f, nullptr};
 // [NEW] Help Command
 cvar_t g_cvar_sf_help = {"sf_help", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_no_smoke = {"no_smoke", "1", 0, 1.0f, nullptr};
-cvar_t g_cvar_no_scope = {"no_scope", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_speedometer = {"speedometer", "1", 0, 1.0f, nullptr};
 cvar_t g_cvar_speedometer_color = {"speedometer_color", "0 255 255", 0, 0.0f,
                                    nullptr};
+cvar_t g_cvar_hide_knife = {"hide_knife", "0", 0, 0.0f, nullptr};
+cvar_t g_cvar_hide_entities = {"hide_entities", "0", 0, 0.0f, nullptr};
 
 // ESP Globals
 int g_PlayerTeam[33] = {0}; // 0=Unknown, 1=T, 2=CT
@@ -195,6 +204,11 @@ typedef int(__cdecl *pfnUserMsgHook)(const char *pszName, int iSize,
                                      void *pbuf);
 typedef int(__cdecl *pfnHookUserMsg_t)(char *szMsgName, pfnUserMsgHook pfn);
 pfnHookUserMsg_t g_pfnHookUserMsg = nullptr;
+
+// --- Weapon Tracking (for hide_knife) ---
+int g_CurrentWeaponID = 0;
+pfnUserMsgHook g_Original_CurWeapon = nullptr;
+cvar_t *g_pCvar_drawviewmodel = nullptr; // Cached pointer - scanned once
 
 // UserMsg Handlers
 int __cdecl MsgFunc_SayText(const char *pszName, int iSize, void *pbuf);
@@ -351,15 +365,93 @@ DWORD g_HUD_PlayerMove_Addr = 0;
 BYTE g_Orig_HUD_PlayerMove[10];
 float g_TrueEngineVelocity[3] = {0.0f, 0.0f, 0.0f};
 
+// --- FindCvarByName: Walk engine cvar linked list (cached, scan once) ---
+cvar_t *FindCvarByName(const char *name) {
+  if (!name) return nullptr;
+  // Walk the engine's cvar linked list starting from our registered cvar
+  cvar_t *current = g_cvar_frame_skip.next;
+  int limit = 10000;
+  while (current && limit-- > 0) {
+    if (!IsBadReadPtr(current, sizeof(cvar_t)) && current->name &&
+        !IsBadReadPtr(current->name, 1) && !strcmp(current->name, name)) {
+      return current;
+    }
+    current = current->next;
+  }
+  return nullptr;
+}
+
+// --- HUD_AddEntity Hook (Hide Knife + Hide Entities) ---
+typedef int(__cdecl *HUD_AddEntity_t)(int type, void *ent, const char *modelname);
+DWORD g_HUD_AddEntity_Addr = 0;
+BYTE g_Orig_HUD_AddEntity[10];
+
+int __cdecl Hook_HUD_AddEntity(int type, void *ent, const char *modelname) {
+  // --- HIDE KNIFE: Direct memory write to r_drawviewmodel ---
+  if (g_cvar_hide_knife.value > 0.0f) {
+    // Search ONCE only (avoid 10K IsBadReadPtr walk every frame)
+    static bool s_drawvmSearched = false;
+    if (!s_drawvmSearched && !g_pCvar_drawviewmodel) {
+      s_drawvmSearched = true;
+      g_pCvar_drawviewmodel = FindCvarByName("r_drawviewmodel");
+    }
+    if (g_pCvar_drawviewmodel) {
+      float desired = (g_CurrentWeaponID == 29) ? 0.0f : 1.0f;
+      if (g_pCvar_drawviewmodel->value != desired)
+        g_pCvar_drawviewmodel->value = desired;
+    }
+  }
+  // --- HIDE ENTITIES: Block non-player entities (except weapons + SOLID brushes) ---
+  #define ENT_SOLID_OFFSET 746
+  if (g_HooksActive && g_cvar_hide_entities.value > 0.0f && ent) {
+    int index = *(int *)ent;
+    if (index > 32) {
+      if (modelname && strstr(modelname, "/w_")) {
+        // Dropped weapon — let it render
+      }
+      else if (modelname && modelname[0] == '*') {
+        short solid = *(short *)((char *)ent + ENT_SOLID_OFFSET);
+        if (solid <= 0) return 0; // Non-solid brush — HIDE
+      }
+      else {
+        return 0; // Non-brush entity — HIDE
+      }
+    }
+  }
+
+  // Unhook -> call original -> rehook (memory kept permanently unlocked)
+  memcpy((void *)g_HUD_AddEntity_Addr, g_Orig_HUD_AddEntity, 6);
+  int result = ((HUD_AddEntity_t)g_HUD_AddEntity_Addr)(type, ent, modelname);
+  BYTE patch[5] = {0xE9, 0, 0, 0, 0};
+  *(DWORD *)(patch + 1) =
+      (DWORD)Hook_HUD_AddEntity - (DWORD)g_HUD_AddEntity_Addr - 5;
+  memcpy((void *)g_HUD_AddEntity_Addr, patch, 5);
+  *(BYTE *)((DWORD)g_HUD_AddEntity_Addr + 5) = 0x90;
+
+  return result;
+}
+
+// --- CurWeapon UserMsg Handler ---
+int __cdecl MsgFunc_CurWeapon(const char *pszName, int iSize, void *pbuf) {
+  if (iSize >= 3 && pbuf) {
+    BYTE *data = (BYTE *)pbuf;
+    int state = data[0]; // 1 = active weapon
+    int wpnID = data[1]; // Weapon ID (Knife = 29)
+    if (state == 1) {
+      g_CurrentWeaponID = wpnID;
+    }
+  }
+  if (g_Original_CurWeapon)
+    return g_Original_CurWeapon(pszName, iSize, pbuf);
+  return 0;
+}
+
 void Hook_HUD_PlayerMove(void *ppmove, int server) {
   // Fast-Patch: Memory is kept unlocked. Swap bytes instantly.
   memcpy((void *)g_HUD_PlayerMove_Addr, g_Orig_HUD_PlayerMove, 6);
 
   ((HUD_PlayerMove_t)g_HUD_PlayerMove_Addr)(ppmove, server);
 
-  // Now that the engine has calculated the perfect physics velocity, we SNATCH
-  // it! This completely eliminates all 1000 FPS lag, delays, and spinning
-  // decimals.
   if (ppmove && !IsBadReadPtr(ppmove, 128)) {
     g_TrueEngineVelocity[0] = *(float *)((char *)ppmove + 92);
     g_TrueEngineVelocity[1] = *(float *)((char *)ppmove + 96);
@@ -371,7 +463,7 @@ void Hook_HUD_PlayerMove(void *ppmove, int server) {
   *(DWORD *)(patch + 1) =
       (DWORD)Hook_HUD_PlayerMove - (DWORD)g_HUD_PlayerMove_Addr - 5;
   memcpy((void *)g_HUD_PlayerMove_Addr, patch, 5);
-  *(BYTE *)((DWORD)g_HUD_PlayerMove_Addr + 5) = 0x90; // NOP
+  *(BYTE *)((DWORD)g_HUD_PlayerMove_Addr + 5) = 0x90;
 }
 
 void Hook_ConPrintf(const char *fmt, void *a1, void *a2, void *a3) {
@@ -398,9 +490,17 @@ void Hook_ConPrintf(const char *fmt, void *a1, void *a2, void *a3) {
 // -------------------------------------------------------------
 pfnUserMsgHook g_Original_SayText = nullptr;
 pfnUserMsgHook g_Original_ScreenFade = nullptr;
+pfnUserMsgHook g_Original_SetFOV = nullptr;
+pfnUserMsgHook g_Original_HideWeapon = nullptr;
 
 bool g_NoFlash = true; // Block ScreenFade
 bool g_NoSmoke = true; // Block smoke sprites
+
+int g_CurrentFOV = 90;
+byte g_ServerHideWeaponFlags = 0;
+int g_CrosshairsSpriteID = -1;
+int g_CrosshairSpriteID = -1;
+int g_SniperScopeSpriteID = -1;
 
 // No-Smoke: Core Engine Sprite Hooks
 // We hook the actual sprite rendering functions in the engine table.
@@ -482,6 +582,11 @@ void EnsureSmokeModelsLoaded() {
           LogDebug("[NoSmoke] Loaded %s -> handle %d\n", smokeSprites[i], idx);
         }
       }
+      
+      // Load crosshair sprites for blocking
+      g_CrosshairsSpriteID = g_pfnSPR_Load("sprites/crosshairs.spr");
+      g_CrosshairSpriteID = g_pfnSPR_Load("sprites/crosshair.spr");
+      g_SniperScopeSpriteID = g_pfnSPR_Load("sprites/sniper_scope.spr");
     }
   }
 }
@@ -580,6 +685,11 @@ void *__cdecl Hook_R_TempSprite(float *pos, float *dir, float scale,
           LogDebug("[NoSmoke] Failed to load %s\n", smokeSprites[i]);
         }
       }
+      
+      // Load crosshair sprites
+      g_CrosshairsSpriteID = g_pfnSPR_Load("sprites/crosshairs.spr");
+      g_CrosshairSpriteID = g_pfnSPR_Load("sprites/crosshair.spr");
+      g_SniperScopeSpriteID = g_pfnSPR_Load("sprites/sniper_scope.spr");
     }
   }
 
@@ -699,6 +809,12 @@ void __cdecl Hook_SPR_Set(int hPic, int r, int g, int b) {
       }
     }
   }
+  
+  if (g_cvar_ch.value != 0.0f) {
+    if (hPic == g_CrosshairsSpriteID || hPic == g_CrosshairSpriteID || hPic == g_SniperScopeSpriteID) {
+      g_BlockCurrentSprite = true;
+    }
+  }
 
   // Call Original (Via global function pointer)
   if (g_Original_SPR_Set)
@@ -752,6 +868,37 @@ int __cdecl MsgFunc_TeamInfo(const char *pszName, int iSize, void *pbuf) {
   }
   if (g_Original_TeamInfo)
     return g_Original_TeamInfo(pszName, iSize, pbuf);
+  return 0;
+}
+
+int __cdecl MsgFunc_SetFOV(const char *pszName, int iSize, void *pbuf) {
+  if (iSize >= 1 && pbuf) {
+    g_CurrentFOV = *(BYTE *)pbuf;
+    if (g_CurrentFOV == 0) // 0 means reset to default (90)
+      g_CurrentFOV = 90;
+    LogDebug("[FOV] SetFOV: %d\n", g_CurrentFOV);
+  }
+  if (g_Original_SetFOV)
+    return g_Original_SetFOV(pszName, iSize, pbuf);
+  return 0;
+}
+
+int __cdecl MsgFunc_HideWeapon(const char *pszName, int iSize, void *pbuf) {
+  if (iSize == 1 && pbuf) {
+    g_ServerHideWeaponFlags = *(byte *)pbuf;
+    byte flags = g_ServerHideWeaponFlags;
+    
+    // Add our custom hides
+    if (g_cvar_ch.value != 0.0f) {
+      flags |= (1 << 6); // HIDEHUD_MISCSTATUS (blanks crosshair)
+    }
+    
+    if (g_Original_HideWeapon)
+      return g_Original_HideWeapon(pszName, iSize, &flags);
+    return 0;
+  }
+  if (g_Original_HideWeapon)
+    return g_Original_HideWeapon(pszName, iSize, pbuf);
   return 0;
 }
 
@@ -973,14 +1120,50 @@ void FindEngineFunctions() {
 
   // Step 6: NOW hook via official API
   LogDebug("[ProScanner] Hooking SayText via official pfnHookUserMsg...\n");
-  g_pfnHookUserMsg("SayText", MsgFunc_SayText);
+  g_pfnHookUserMsg((char *)"SayText", MsgFunc_SayText);
   LogDebug("[ProScanner] SayText hooked! Original handler: 0x%X\n",
            (DWORD)g_Original_SayText);
 
   // Hook ScreenFade for NoFlash
-  g_pfnHookUserMsg("ScreenFade", MsgFunc_ScreenFade);
+  g_pfnHookUserMsg((char *)"ScreenFade", MsgFunc_ScreenFade);
   LogDebug("[ProScanner] ScreenFade hooked! Original handler: 0x%X\n",
            (DWORD)g_Original_ScreenFade);
+
+  // Hook SetFOV
+  DWORD fovRef = FindStringRef(clientBase, 0x800000, "SetFOV");
+  if (fovRef) {
+    for (int k = 5; k < 40; k++) {
+      if (*(BYTE *)(fovRef - k) == 0x68) {
+        DWORD funcPtr = *(DWORD *)(fovRef - k + 1);
+        if (funcPtr > clientBase && funcPtr < clientBase + 0x800000 &&
+            !IsBadReadPtr((void *)funcPtr, 4)) {
+          g_Original_SetFOV = (pfnUserMsgHook)funcPtr;
+          LogDebug("[FOV] Found original SetFOV handler at 0x%X\n", funcPtr);
+          break;
+        }
+      }
+    }
+  }
+  g_pfnHookUserMsg((char *)"SetFOV", MsgFunc_SetFOV);
+  LogDebug("[FOV] SetFOV hooked!\n");
+
+  // Hook HideWeapon
+  DWORD hideRef = FindStringRef(clientBase, 0x800000, "HideWeapon");
+  if (hideRef) {
+    for (int k = 5; k < 40; k++) {
+      if (*(BYTE *)(hideRef - k) == 0x68) {
+        DWORD funcPtr = *(DWORD *)(hideRef - k + 1);
+        if (funcPtr > clientBase && funcPtr < clientBase + 0x800000 &&
+            !IsBadReadPtr((void *)funcPtr, 4)) {
+          g_Original_HideWeapon = (pfnUserMsgHook)funcPtr;
+          LogDebug("[HideWeapon] Found original handler at 0x%X\n", funcPtr);
+          break;
+        }
+      }
+    }
+  }
+  g_pfnHookUserMsg((char *)"HideWeapon", MsgFunc_HideWeapon);
+  LogDebug("[HideWeapon] HideWeapon hooked!\n");
 
   // Hook TeamInfo for ESP team tracking
   DWORD tiRef = FindStringRef(clientBase, 0x800000, "TeamInfo");
@@ -997,8 +1180,27 @@ void FindEngineFunctions() {
       }
     }
   }
-  g_pfnHookUserMsg("TeamInfo", MsgFunc_TeamInfo);
+  g_pfnHookUserMsg((char *)"TeamInfo", MsgFunc_TeamInfo);
   LogDebug("[ESP] TeamInfo hooked for team tracking!\n");
+
+  // Hook CurWeapon for weapon ID tracking (hide_knife)
+  DWORD cwRef = FindStringRef(clientBase, 0x800000, "CurWeapon");
+  if (cwRef) {
+    for (int k = 5; k < 40; k++) {
+      if (*(BYTE *)(cwRef - k) == 0x68) {
+        DWORD funcPtr = *(DWORD *)(cwRef - k + 1);
+        if (funcPtr > clientBase && funcPtr < clientBase + 0x800000 &&
+            !IsBadReadPtr((void *)funcPtr, 4)) {
+          g_Original_CurWeapon = (pfnUserMsgHook)funcPtr;
+          LogDebug("[HideKnife] Found original CurWeapon handler at 0x%X\n",
+                   funcPtr);
+          break;
+        }
+      }
+    }
+  }
+  g_pfnHookUserMsg((char *)"CurWeapon", MsgFunc_CurWeapon);
+  LogDebug("[HideKnife] CurWeapon hooked for weapon ID tracking!\n");
 
   // Extract ESP functions from engine table (Half-Life SDK indices)
   g_pfnFillRGBA = (FillRGBA_t)engineTable[11];
@@ -1067,6 +1269,7 @@ void FindEngineFunctions() {
   // Extract SPR_Load for potential future use
   g_pfnSPR_Load = (SPR_Load_t)engineTable[0];
   LogDebug("[NoSmoke] SPR_Load[0]=0x%X\n", (DWORD)g_pfnSPR_Load);
+
 
   LogDebug("[ProScanner] === ALL DONE! Engine table found! ===\n");
 }
@@ -1591,6 +1794,22 @@ int __cdecl Hook_DrawEngine() {
 
 // ===== HUD_REDRAW HOOK (ESP drawing happens here, after 3D world) =====
 int __cdecl Hook_HUD_Redraw(float time, int intermission) {
+  // ------------------------------------
+  // Update HideWeapon dynamically if 'ch' is toggled
+  // ------------------------------------
+  static bool lastCrosshairState = false;
+  bool currentCrosshairState = (g_cvar_ch.value != 0.0f);
+  if (lastCrosshairState != currentCrosshairState) {
+    lastCrosshairState = currentCrosshairState;
+    if (g_Original_HideWeapon) {
+      byte flags = g_ServerHideWeaponFlags;
+      if (currentCrosshairState) {
+        flags |= (1 << 6); // HIDEHUD_MISCSTATUS
+      }
+      g_Original_HideWeapon("HideWeapon", 1, &flags);
+    }
+  }
+
   // --- REAL FPS CALCULATION ---
   DWORD curTime = GetTickCount();
   if (g_LastFPSUpdateTime == 0) {
@@ -1918,24 +2137,44 @@ int __cdecl Hook_HUD_Redraw(float time, int intermission) {
       }
     }
 
-    // --- NO SCOPE CROSSHAIR ---
-    if (g_cvar_no_scope.value != 0.0f) {
+
+    // --- CUSTOM CROSSHAIR ---
+    bool isScoped = (g_CurrentFOV < 90 && g_CurrentFOV > 0);
+    if (g_cvar_ch.value != 0.0f && !isScoped) {
       if (g_pfnGetScreenInfo && g_pfnFillRGBA) {
+        
         SCREENINFO scr = {0};
         scr.iSize = sizeof(SCREENINFO);
         g_pfnGetScreenInfo(&scr);
         if (scr.iWidth > 0 && scr.iHeight > 0) {
           int cx = scr.iWidth / 2;
           int cy = scr.iHeight / 2;
-          int r = 0, g = 255, b = 0, a = 255; // Bright Green
-
-          // Draw a small '+' crosshair
+          
+          int r = 0, g = 255, b = 0, a = 255;
+          if (g_cvar_ch_color.string) {
+            sscanf(g_cvar_ch_color.string, "%d %d %d", &r, &g, &b);
+          }
+          
           int length = 5;
+          if (g_cvar_ch_length.string) length = atoi(g_cvar_ch_length.string);
+          if (length < 1) length = 1;
+          
+          int offset = 5;
+          if (g_cvar_ch_offset.string) offset = atoi(g_cvar_ch_offset.string);
+          if (offset < 0) offset = 0;
+          
           int thick = 2;
-          g_pfnFillRGBA(cx - length, cy - (thick / 2), length * 2, thick, r, g,
-                        b, a); // Horizontal
-          g_pfnFillRGBA(cx - (thick / 2), cy - length, thick, length * 2, r, g,
-                        b, a); // Vertical
+          if (g_cvar_ch_thickness.string) thick = atoi(g_cvar_ch_thickness.string);
+          if (thick < 1) thick = 1;
+
+          // Top
+          g_pfnFillRGBA(cx - (thick / 2), cy - offset - length, thick, length, r, g, b, a);
+          // Bottom
+          g_pfnFillRGBA(cx - (thick / 2), cy + offset, thick, length, r, g, b, a);
+          // Left
+          g_pfnFillRGBA(cx - offset - length, cy - (thick / 2), length, thick, r, g, b, a);
+          // Right
+          g_pfnFillRGBA(cx + offset, cy - (thick / 2), length, thick, r, g, b, a);
         }
       }
     }
@@ -2060,8 +2299,7 @@ void InstallHooks() {
 
   PatchByte(g_HwBase + OFF_CMD_PATCH, 0xEB);
 
-  // Independent HUD_PlayerMove Hooking to avoid the 20s HUD_Redraw dependency
-  // delay
+  // Locate HUD_PlayerMove (once)
   if (!g_HUD_PlayerMove_Addr) {
     HMODULE hClient = GetModuleHandleA("client.dll");
     if (hClient) {
@@ -2070,27 +2308,25 @@ void InstallHooks() {
       if (!pfnPMove)
         pfnPMove =
             (HUD_PlayerMove_t)GetProcAddress(hClient, "_HUD_PlayerMove@8");
-
       if (pfnPMove) {
         g_HUD_PlayerMove_Addr = (DWORD)pfnPMove;
-        LogDebug("[Hooks] Found HUD_PlayerMove at 0x%X\n",
-                 g_HUD_PlayerMove_Addr);
-
-        // PERMANENT UNLOCK for Fast-Patching zero-overhead
+        LogDebug("[Hooks] Found HUD_PlayerMove at 0x%X\n", g_HUD_PlayerMove_Addr);
         DWORD old;
-        VirtualProtect((void *)g_HUD_PlayerMove_Addr, 6, PAGE_EXECUTE_READWRITE,
-                       &old);
+        VirtualProtect((void *)g_HUD_PlayerMove_Addr, 6, PAGE_EXECUTE_READWRITE, &old);
         memcpy(g_Orig_HUD_PlayerMove, (void *)g_HUD_PlayerMove_Addr, 6);
-
-        BYTE patch[5] = {0xE9, 0, 0, 0, 0};
-        *(DWORD *)(patch + 1) =
-            (DWORD)Hook_HUD_PlayerMove - (DWORD)g_HUD_PlayerMove_Addr - 5;
-        memcpy((void *)g_HUD_PlayerMove_Addr, patch, 5);
-        *(BYTE *)((DWORD)g_HUD_PlayerMove_Addr + 5) = 0x90; // NOP
-        LogDebug(
-            "[Hooks] HUD_PlayerMove Hooked successfully (Memory unlocked)!\n");
       }
     }
+  }
+  // ALWAYS re-apply JMP patch (critical for F11 toggle)
+  if (g_HUD_PlayerMove_Addr) {
+    DWORD old;
+    VirtualProtect((void *)g_HUD_PlayerMove_Addr, 6, PAGE_EXECUTE_READWRITE, &old);
+    BYTE patch[5] = {0xE9, 0, 0, 0, 0};
+    *(DWORD *)(patch + 1) =
+        (DWORD)Hook_HUD_PlayerMove - (DWORD)g_HUD_PlayerMove_Addr - 5;
+    memcpy((void *)g_HUD_PlayerMove_Addr, patch, 5);
+    *(BYTE *)((DWORD)g_HUD_PlayerMove_Addr + 5) = 0x90;
+    LogDebug("[Hooks] HUD_PlayerMove patched (0x%X)\n", g_HUD_PlayerMove_Addr);
   }
 
   // Install DrawEngine Hook (cached - only scan once)
@@ -2265,6 +2501,35 @@ void InstallHooks() {
     LogDebug("[NoSmoke] Smoke function re-patched -> RET!\n");
   }
 
+  // Locate HUD_AddEntity (once)
+  if (!g_HUD_AddEntity_Addr) {
+    HMODULE hClient = GetModuleHandleA("client.dll");
+    if (hClient) {
+      HUD_AddEntity_t pfnAdd =
+          (HUD_AddEntity_t)GetProcAddress(hClient, "HUD_AddEntity");
+      if (!pfnAdd)
+        pfnAdd = (HUD_AddEntity_t)GetProcAddress(hClient, "_HUD_AddEntity@12");
+      if (pfnAdd) {
+        g_HUD_AddEntity_Addr = (DWORD)pfnAdd;
+        LogDebug("[Hooks] Found HUD_AddEntity at 0x%X\n", g_HUD_AddEntity_Addr);
+        DWORD old;
+        VirtualProtect((void *)g_HUD_AddEntity_Addr, 6, PAGE_EXECUTE_READWRITE, &old);
+        memcpy(g_Orig_HUD_AddEntity, (void *)g_HUD_AddEntity_Addr, 6);
+      }
+    }
+  }
+  // ALWAYS re-apply JMP patch (critical for F11 toggle)
+  if (g_HUD_AddEntity_Addr) {
+    DWORD old;
+    VirtualProtect((void *)g_HUD_AddEntity_Addr, 6, PAGE_EXECUTE_READWRITE, &old);
+    BYTE patch[5] = {0xE9, 0, 0, 0, 0};
+    *(DWORD *)(patch + 1) =
+        (DWORD)Hook_HUD_AddEntity - (DWORD)g_HUD_AddEntity_Addr - 5;
+    memcpy((void *)g_HUD_AddEntity_Addr, patch, 5);
+    *(BYTE *)((DWORD)g_HUD_AddEntity_Addr + 5) = 0x90;
+    LogDebug("[Hooks] HUD_AddEntity patched (0x%X)\n", g_HUD_AddEntity_Addr);
+  }
+
   g_HooksActive = true;
 }
 
@@ -2334,9 +2599,28 @@ void RemoveHooks() {
   // Restore UserMsg Hooks
   if (g_pfnHookUserMsg) {
     if (g_Original_SayText)
-      g_pfnHookUserMsg("SayText", g_Original_SayText);
+      g_pfnHookUserMsg((char *)"SayText", g_Original_SayText);
     if (g_Original_ScreenFade)
-      g_pfnHookUserMsg("ScreenFade", g_Original_ScreenFade);
+      g_pfnHookUserMsg((char *)"ScreenFade", g_Original_ScreenFade);
+    if (g_Original_CurWeapon)
+      g_pfnHookUserMsg((char *)"CurWeapon", g_Original_CurWeapon);
+    if (g_Original_SetFOV)
+      g_pfnHookUserMsg((char *)"SetFOV", g_Original_SetFOV);
+    if (g_Original_HideWeapon) {
+      // Restore standard HUD elements before unhooking
+      g_Original_HideWeapon("HideWeapon", 1, &g_ServerHideWeaponFlags);
+      g_pfnHookUserMsg((char *)"HideWeapon", g_Original_HideWeapon);
+    }
+  }
+
+  // Restore HUD_AddEntity
+  if (g_HUD_AddEntity_Addr) {
+    Restore(g_HUD_AddEntity_Addr, g_Orig_HUD_AddEntity, 6);
+  }
+
+  // Restore r_drawviewmodel to visible
+  if (g_pCvar_drawviewmodel) {
+    g_pCvar_drawviewmodel->value = 1.0f;
   }
 
   PatchByte(g_HwBase + OFF_CMD_PATCH, 0x74);
@@ -2359,6 +2643,7 @@ void RemoveHooks() {
     VirtualProtect((void *)g_SmokeFuncAddr, 1, old, &old);
     LogDebug("[NoSmoke] Smoke function restored\n");
   }
+
 
   g_HooksActive = false;
 }
@@ -2509,11 +2794,19 @@ DWORD WINAPI MainThread(LPVOID) {
     g_RegisterCvar(&g_cvar_t_esp);
     g_RegisterCvar(&g_cvar_esp_type);
     g_RegisterCvar(&g_cvar_esp_label);
+    g_RegisterCvar(&g_cvar_ch);
+    g_RegisterCvar(&g_cvar_ch_color);
+    g_RegisterCvar(&g_cvar_ch_length);
+    g_RegisterCvar(&g_cvar_ch_offset);
+    g_RegisterCvar(&g_cvar_ch_thickness);
+    g_RegisterCvar(&g_cvar_ch_import);
+    g_RegisterCvar(&g_cvar_ch_export);
     g_RegisterCvar(&g_cvar_sf_help);
     g_RegisterCvar(&g_cvar_no_smoke);
-    g_RegisterCvar(&g_cvar_no_scope);
     g_RegisterCvar(&g_cvar_speedometer);
     g_RegisterCvar(&g_cvar_speedometer_color);
+    g_RegisterCvar(&g_cvar_hide_knife);
+    g_RegisterCvar(&g_cvar_hide_entities);
     g_RegisterCvar(&g_cvar_showfps);
   }
 
@@ -2560,11 +2853,27 @@ DWORD WINAPI MainThread(LPVOID) {
           ((void (*)(const char *, ...))g_pfnConPrintf)(
               "  no_smoke <0/1>      - Toggle Smoke Removal\n");
           ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  no_scope <0/1>      - Draw crosshair for Sniper Rifles\n");
+              "  ch <0/1>            - Toggle Custom Crosshair\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  ch_color            - RGB color (e.g., \"0 255 0\")\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  ch_length           - Crosshair line length\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  ch_offset           - Crosshair center offset\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  ch_thickness        - Crosshair line thickness\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  ch_import <name>    - Import cstrike/name.txt profile\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  ch_export <name>    - Export cstrike/name.txt profile\n");
           ((void (*)(const char *, ...))g_pfnConPrintf)(
               "  speedometer <0/1>   - Toggle Speedometer\n");
           ((void (*)(const char *, ...))g_pfnConPrintf)(
               "  speedometer_color   - RGB color (e.g., \"0 255 255\")\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  hide_knife <0/1>    - Hide Knife Viewmodel\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  hide_entities <0/1> - Hide Non Solid Map Entities\n");
           ((void (*)(const char *, ...))g_pfnConPrintf)(
               "  showfps <0/1>       - Toggle Real FPS Counter\n");
           ((void (*)(const char *, ...))g_pfnConPrintf)(
@@ -2583,6 +2892,58 @@ DWORD WINAPI MainThread(LPVOID) {
 
       if (g_cvar_frame_skip.string) {
         g_SkipVal = atoi(g_cvar_frame_skip.string);
+      }
+
+      // Handle Crosshair Export
+      static char lastExport[64] = "";
+      if (g_cvar_ch_export.string && g_cvar_ch_export.string[0] && strcmp(lastExport, g_cvar_ch_export.string) != 0) {
+        strcpy(lastExport, g_cvar_ch_export.string);
+        char path[256];
+        sprintf(path, "cstrike/%s.txt", g_cvar_ch_export.string);
+        FILE *f = fopen(path, "w");
+        if (f) {
+          fprintf(f, "%s\n%s\n%s\n%s\n", 
+            g_cvar_ch_color.string ? g_cvar_ch_color.string : "0 255 0",
+            g_cvar_ch_length.string ? g_cvar_ch_length.string : "5",
+            g_cvar_ch_offset.string ? g_cvar_ch_offset.string : "5",
+            g_cvar_ch_thickness.string ? g_cvar_ch_thickness.string : "2");
+          fclose(f);
+          if (g_pfnConPrintf) {
+            ((void (*)(const char *, ...))g_pfnConPrintf)("[SF] Crosshair exported to %s\n", path);
+          }
+        }
+      }
+
+      // Handle Crosshair Import
+      static char lastImport[64] = "";
+      if (g_cvar_ch_import.string && g_cvar_ch_import.string[0] && strcmp(lastImport, g_cvar_ch_import.string) != 0) {
+        strcpy(lastImport, g_cvar_ch_import.string);
+        char path[256];
+        sprintf(path, "cstrike/%s.txt", g_cvar_ch_import.string);
+        FILE *f = fopen(path, "r");
+        if (f) {
+          char col[64]={0}, len[64]={0}, off[64]={0}, thk[64]={0};
+          if (fgets(col, 64, f) && fgets(len, 64, f) && fgets(off, 64, f) && fgets(thk, 64, f)) {
+            col[strcspn(col, "\r\n")] = 0;
+            len[strcspn(len, "\r\n")] = 0;
+            off[strcspn(off, "\r\n")] = 0;
+            thk[strcspn(thk, "\r\n")] = 0;
+            
+            char cmd[512];
+            sprintf(cmd, "ch_color \"%s\"; ch_length \"%s\"; ch_offset \"%s\"; ch_thickness \"%s\"\n", col, len, off, thk);
+            if (g_pfnClientCmd) {
+              g_pfnClientCmd(cmd);
+              if (g_pfnConPrintf) {
+                ((void (*)(const char *, ...))g_pfnConPrintf)("[SF] Crosshair imported from %s\n", path);
+              }
+            }
+          }
+          fclose(f);
+        } else {
+          if (g_pfnConPrintf) {
+            ((void (*)(const char *, ...))g_pfnConPrintf)("[SF] Failed to load %s\n", path);
+          }
+        }
       }
 
       // Update delay dynamically

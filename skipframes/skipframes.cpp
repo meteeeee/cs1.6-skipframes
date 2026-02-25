@@ -146,7 +146,7 @@ int main() {
 
   char tempPath[MAX_PATH];
   GetTempPathA(MAX_PATH, tempPath);
-  strcat(tempPath, "skipframes-v1.5.2.dll");
+  strcat(tempPath, "skipframes-v1.6.0.dll");
 
   // 1. Drop DLL
   if (!DropFile(tempPath, g_DllData, g_DllSize)) {
@@ -159,22 +159,7 @@ int main() {
   if (InjectStandard(pid, tempPath)) {
     Log("\n[SUCCESS] Injected!\n");
     Log("--- Commands ---\n");
-    Log("  frame_skip <value>  - Skip frames (0=Off)\n");
-    Log("  change_id <0/1>     - Toggle ID Changer\n");
-    Log("  sf_help <0/1>       - Show Help Menu\n");
-    Log("  sb <0/1>            - Toggle SayiBilen (1=Ready)\n");
-    Log("  sb_range <N>        - Guess Range (Default: 100)\n");
-    Log("  sb_delay <MS>       - Delay in ms (Default: 5)\n");
-    Log("  esp_ct <0/1>        - Toggle CT ESP\n");
-    Log("  esp_t <0/1>         - Toggle T ESP\n");
-    Log("  esp_type <1/2/3>    - 1=Glow 2=Box 3=Both\n");
-    Log("  esp_label <0/1>     - Toggle Name+Distance Labels\n");
-    Log("  no_smoke <0/1>      - Toggle Smoke Removal\n");
-    Log("  no_scope <0/1>      - Draw crosshair for Sniper Rifles\n");
-    Log("  speedometer <0/1>   - Toggle Speedometer\n");
-    Log("  speedometer_color   - RGB string (e.g., \"0 255 255\")\n");
-    Log("  showfps <0/1>       - Toggle Real FPS Counter\n");
-    Log("  F11                 - Toggle Stealth (Freeze-Patch-Thaw)\n");
+    Log("  sf_help <0/1>       - Show Help Menu in-game\n");
     Log("--------------------\n");
   } else {
     Log("\n[!] Injection Failed.\n");
