@@ -146,7 +146,7 @@ int main() {
 
   char tempPath[MAX_PATH];
   GetTempPathA(MAX_PATH, tempPath);
-  strcat(tempPath, "skipframes-v1.6.0.dll");
+  strcat(tempPath, "skipframes-v1.7.0.dll");
 
   // 1. Drop DLL
   if (!DropFile(tempPath, g_DllData, g_DllSize)) {

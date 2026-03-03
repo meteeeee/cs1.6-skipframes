@@ -103,6 +103,23 @@ cvar_t g_cvar_speedometer_color = {"speedometer_color", "0 255 255", 0, 0.0f,
 cvar_t g_cvar_hide_knife = {"hide_knife", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_hide_entities = {"hide_entities", "0", 0, 0.0f, nullptr};
 
+// [NEW] +strafe_boost Engine Command
+typedef int (*AddCommand_t)(char *, void (*)());
+AddCommand_t g_pfnAddCommand = nullptr;
+bool g_StrafeBoostActive = false;
+
+void Cmd_StrafeBoost_On() { g_StrafeBoostActive = true; }
+void Cmd_StrafeBoost_Off() { g_StrafeBoostActive = false; }
+
+// CL_CreateMove hook globals
+typedef void (__cdecl *HUD_CL_CreateMove_t)(float, void *, int);
+HUD_CL_CreateMove_t g_Original_CL_CreateMove = nullptr;
+DWORD g_CL_CreateMove_Addr = 0;
+BYTE g_Orig_CL_CreateMove[6] = {0};
+
+#define M_PI_F 3.14159265358979323846f
+#define IN_JUMP (1 << 1)
+
 // ESP Globals
 int g_PlayerTeam[33] = {0}; // 0=Unknown, 1=T, 2=CT
 
@@ -1270,6 +1287,9 @@ void FindEngineFunctions() {
   g_pfnSPR_Load = (SPR_Load_t)engineTable[0];
   LogDebug("[NoSmoke] SPR_Load[0]=0x%X\n", (DWORD)g_pfnSPR_Load);
 
+  // Extract pfnAddCommand (index 17) for +strafe_boost
+  g_pfnAddCommand = (AddCommand_t)engineTable[17];
+  LogDebug("[StrafeBoost] pfnAddCommand[17]=0x%X\n", (DWORD)g_pfnAddCommand);
 
   LogDebug("[ProScanner] === ALL DONE! Engine table found! ===\n");
 }
@@ -2291,6 +2311,101 @@ void Restore(DWORD from, BYTE *storage, int len) {
   VirtualProtect((void *)from, len, old, &old);
 }
 
+
+// -------------------------------------------------------------
+// +strafe_boost: Air Strafe Optimizer
+// -------------------------------------------------------------
+// Mathematically optimal air-strafe boost.
+// GoldSrc air acceleration caps wishspeed at ~30 units, so input
+// MAGNITUDE doesn't affect speed gain — only DIRECTION matters.
+// This fully overrides the direction on every frame for maximum speed gain.
+static void ApplyStrafeHelper(void *cmd) {
+  if (!cmd) return;
+
+  float *pViewAngles = (float *)((char *)cmd + 4);
+  float *pForward    = (float *)((char *)cmd + 16);
+  float *pSideMove   = (float *)((char *)cmd + 20);
+
+  float vx = g_TrueEngineVelocity[0], vy = g_TrueEngineVelocity[1];
+  float speed2D = sqrtf(vx * vx + vy * vy);
+  float yaw_rad = pViewAngles[1] * (M_PI_F / 180.0f);
+
+  // If nearly standing still, just push sideways (alternating) to start gaining speed
+  if (speed2D < 15.0f) {
+    static bool sway = true;
+    static int swayCount = 0;
+    swayCount++;
+    if (swayCount >= 2) { swayCount = 0; sway = !sway; }
+    *pForward = 0;
+    *pSideMove = sway ? 400.0f : -400.0f;
+    return;
+  }
+
+  // Calculate optimal strafe direction
+  float vel_angle = atan2f(vy, vx);
+  float angle_diff = vel_angle - yaw_rad;
+  while (angle_diff > M_PI_F) angle_diff -= 2.0f * M_PI_F;
+  while (angle_diff < -M_PI_F) angle_diff += 2.0f * M_PI_F;
+
+  float sin_diff = sinf(angle_diff);
+  float optimalDir = (sin_diff >= 0.0f) ? 1.0f : -1.0f;
+
+  // Calculate the mathematically optimal movement values (magnitude = 400)
+  float optSideMove = optimalDir * 400.0f;
+
+  float osin = sinf(yaw_rad);
+  float ocos = cosf(yaw_rad);
+  float nangle = yaw_rad * 2.0f - vel_angle;
+  float nsin = sinf(nangle);
+  float ncos = cosf(nangle);
+  float optForward = optSideMove * (osin * ncos - ocos * nsin);
+
+  // Fully override manual input with optimal input (100% boost)
+  *pForward  = optForward;
+  *pSideMove = optSideMove;
+}
+
+// -------------------------------------------------------------
+// +strafe_boost: CL_CreateMove Hook
+// -------------------------------------------------------------
+void __cdecl Hook_CL_CreateMove(float frametime, void *cmd, int active) {
+  if (!g_CL_CreateMove_Addr) return;
+
+  // Unhook, call original
+  DWORD old;
+  VirtualProtect((void *)g_CL_CreateMove_Addr, 10, PAGE_EXECUTE_READWRITE, &old);
+  memcpy((void *)g_CL_CreateMove_Addr, g_Orig_CL_CreateMove, 6);
+  VirtualProtect((void *)g_CL_CreateMove_Addr, 10, old, &old);
+
+  g_Original_CL_CreateMove(frametime, cmd, active);
+
+  if (cmd && active && g_StrafeBoostActive) {
+    // Check if player is in the air using velocity Z component
+    // If Z velocity is non-zero OR very small, player is likely airborne
+    // Also works during bhop since you're never truly grounded between hops
+    float vz = g_TrueEngineVelocity[2];
+    float vx = g_TrueEngineVelocity[0];
+    float vy = g_TrueEngineVelocity[1];
+    float speed2D = sqrtf(vx * vx + vy * vy);
+
+    // Consider "in air" if: Z velocity is non-zero (falling/rising)
+    // OR if moving fast enough that strafe optimization helps
+    bool isInAir = (vz > 1.0f || vz < -1.0f) || speed2D > 100.0f;
+
+    if (isInAir) {
+      ApplyStrafeHelper(cmd);
+    }
+  }
+
+  // Re-hook
+  VirtualProtect((void *)g_CL_CreateMove_Addr, 10, PAGE_EXECUTE_READWRITE, &old);
+  BYTE patch[5] = {0xE9, 0, 0, 0, 0};
+  *(DWORD *)(patch + 1) = (DWORD)Hook_CL_CreateMove - g_CL_CreateMove_Addr - 5;
+  memcpy((void *)g_CL_CreateMove_Addr, patch, 5);
+  *(BYTE *)(g_CL_CreateMove_Addr + 5) = 0x90;
+  VirtualProtect((void *)g_CL_CreateMove_Addr, 10, old, &old);
+}
+
 void InstallHooks() {
   if (g_HooksActive)
     return;
@@ -2530,6 +2645,69 @@ void InstallHooks() {
     LogDebug("[Hooks] HUD_AddEntity patched (0x%X)\n", g_HUD_AddEntity_Addr);
   }
 
+  // CL_CreateMove Hook (Strafe Boost)
+  if (!g_CL_CreateMove_Addr) {
+    HMODULE hClient = GetModuleHandleA("client.dll");
+    if (hClient) {
+      const char *names[] = {"CL_CreateMove", "_CL_CreateMove",
+                             "HUD_CL_CreateMove", "_HUD_CL_CreateMove", nullptr};
+      for (int i = 0; names[i]; i++) {
+        g_Original_CL_CreateMove =
+            (HUD_CL_CreateMove_t)GetProcAddress(hClient, names[i]);
+        if (g_Original_CL_CreateMove) {
+          g_CL_CreateMove_Addr = (DWORD)g_Original_CL_CreateMove;
+          LogDebug("[Hooks] Found CL_CreateMove at 0x%X (%s)\n",
+                   g_CL_CreateMove_Addr, names[i]);
+          break;
+        }
+      }
+    }
+  }
+  if (g_CL_CreateMove_Addr) {
+    DWORD old;
+    VirtualProtect((void *)g_CL_CreateMove_Addr, 10, PAGE_EXECUTE_READWRITE, &old);
+    memcpy(g_Orig_CL_CreateMove, (void *)g_CL_CreateMove_Addr, 6);
+    BYTE patch[5] = {0xE9, 0, 0, 0, 0};
+    *(DWORD *)(patch + 1) =
+        (DWORD)Hook_CL_CreateMove - g_CL_CreateMove_Addr - 5;
+    memcpy((void *)g_CL_CreateMove_Addr, patch, 5);
+    *(BYTE *)(g_CL_CreateMove_Addr + 5) = 0x90;
+    VirtualProtect((void *)g_CL_CreateMove_Addr, 10, old, &old);
+    LogDebug("[Hooks] CL_CreateMove hooked (Strafe Boost ready)\n");
+  }
+
+  // HUD_PlayerMove Hook (for velocity reading)
+  if (!g_HUD_PlayerMove_Addr) {
+    HMODULE hClient = GetModuleHandleA("client.dll");
+    if (hClient) {
+      HUD_PlayerMove_t pfnPMove =
+          (HUD_PlayerMove_t)GetProcAddress(hClient, "HUD_PlayerMove");
+      if (!pfnPMove)
+        pfnPMove =
+            (HUD_PlayerMove_t)GetProcAddress(hClient, "_HUD_PlayerMove@8");
+      if (pfnPMove) {
+        g_HUD_PlayerMove_Addr = (DWORD)pfnPMove;
+        LogDebug("[Hooks] Found HUD_PlayerMove at 0x%X\n", g_HUD_PlayerMove_Addr);
+        DWORD old;
+        VirtualProtect((void *)g_HUD_PlayerMove_Addr, 6, PAGE_EXECUTE_READWRITE, &old);
+        memcpy(g_Orig_HUD_PlayerMove, (void *)g_HUD_PlayerMove_Addr, 6);
+      }
+    }
+  }
+  if (g_HUD_PlayerMove_Addr) {
+    DWORD old;
+    VirtualProtect((void *)g_HUD_PlayerMove_Addr, 6, PAGE_EXECUTE_READWRITE, &old);
+    BYTE patch[5] = {0xE9, 0, 0, 0, 0};
+    *(DWORD *)(patch + 1) =
+        (DWORD)Hook_HUD_PlayerMove - (DWORD)g_HUD_PlayerMove_Addr - 5;
+    memcpy((void *)g_HUD_PlayerMove_Addr, patch, 5);
+    *(BYTE *)((DWORD)g_HUD_PlayerMove_Addr + 5) = 0x90;
+    LogDebug("[Hooks] HUD_PlayerMove patched (0x%X)\n", g_HUD_PlayerMove_Addr);
+  }
+
+  // (Command registration moved to MainThread)
+
+
   g_HooksActive = true;
 }
 
@@ -2582,6 +2760,19 @@ void RemoveHooks() {
     }
     LogDebug("[NoSmoke] Restored EfxAPI table hooks\n");
   }
+
+  // Restore HUD_PlayerMove
+  if (g_HUD_PlayerMove_Addr) {
+    Restore(g_HUD_PlayerMove_Addr, g_Orig_HUD_PlayerMove, 6);
+  }
+
+  // Restore CL_CreateMove (Strafe Boost)
+  if (g_CL_CreateMove_Addr) {
+    Restore(g_CL_CreateMove_Addr, g_Orig_CL_CreateMove, 6);
+  }
+
+  // Reset strafe boost state
+  g_StrafeBoostActive = false;
 
   // Restore DrawEngine CALL offset (CRITICAL - was missing before!)
   if (g_HUD_Redraw_Addr && g_Orig_HUD_Redraw[0] != 0) {
@@ -2810,6 +3001,13 @@ DWORD WINAPI MainThread(LPVOID) {
     g_RegisterCvar(&g_cvar_showfps);
   }
 
+  // Register +strafe_boost / -strafe_boost commands
+  if (g_pfnAddCommand) {
+    g_pfnAddCommand((char *)"+strafe_boost", Cmd_StrafeBoost_On);
+    g_pfnAddCommand((char *)"-strafe_boost", Cmd_StrafeBoost_Off);
+    LogDebug("[StrafeBoost] +strafe_boost commands registered safely in MainThread!\n");
+  }
+
   InstallHooks();
 
   if (g_CreateInterface) {
@@ -2876,6 +3074,8 @@ DWORD WINAPI MainThread(LPVOID) {
               "  hide_entities <0/1> - Hide Non Solid Map Entities\n");
           ((void (*)(const char *, ...))g_pfnConPrintf)(
               "  showfps <0/1>       - Toggle Real FPS Counter\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  +strafe_boost       - Hold to auto-perfect air acceleration\n");
           ((void (*)(const char *, ...))g_pfnConPrintf)(
               "  F11                 - Toggle Stealth (Freeze-Patch-Thaw)\n");
           ((void (*)(const char *, ...))g_pfnConPrintf)(
