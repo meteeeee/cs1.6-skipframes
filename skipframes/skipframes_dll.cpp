@@ -102,6 +102,7 @@ cvar_t g_cvar_speedometer_color = {"speedometer_color", "0 255 255", 0, 0.0f,
                                    nullptr};
 cvar_t g_cvar_hide_knife = {"hide_knife", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_hide_entities = {"hide_entities", "0", 0, 0.0f, nullptr};
+cvar_t g_cvar_anti_drug = {"anti_drug", "1", 0, 1.0f, nullptr};
 
 // [NEW] +strafe_boost Engine Command
 typedef int (*AddCommand_t)(char *, void (*)());
@@ -890,10 +891,23 @@ int __cdecl MsgFunc_TeamInfo(const char *pszName, int iSize, void *pbuf) {
 
 int __cdecl MsgFunc_SetFOV(const char *pszName, int iSize, void *pbuf) {
   if (iSize >= 1 && pbuf) {
-    g_CurrentFOV = *(BYTE *)pbuf;
-    if (g_CurrentFOV == 0) // 0 means reset to default (90)
-      g_CurrentFOV = 90;
-    LogDebug("[FOV] SetFOV: %d\n", g_CurrentFOV);
+    BYTE serverFOV = *(BYTE *)pbuf;
+    if (serverFOV == 0) // 0 means reset to default (90)
+      serverFOV = 90;
+      
+    // Store original requested FOV for crosshair scoping checks
+    g_CurrentFOV = serverFOV;
+
+    int isAntiDrug = 1;
+    if (g_cvar_anti_drug.string) isAntiDrug = atoi(g_cvar_anti_drug.string);
+    
+    // If Anti-Drug is ON and the server tries to set FOV above 90 (drug effect),
+    // we block the drug by forcing the engine to stay at the default 90 FOV.
+    if (isAntiDrug > 0 && serverFOV > 90) {
+      *(BYTE *)pbuf = 90;
+    }
+
+    LogDebug("[FOV] SetFOV intercepted: server=%d anti_drug=%d final=%d\n", serverFOV, isAntiDrug, *(BYTE *)pbuf);
   }
   if (g_Original_SetFOV)
     return g_Original_SetFOV(pszName, iSize, pbuf);
@@ -2999,6 +3013,7 @@ DWORD WINAPI MainThread(LPVOID) {
     g_RegisterCvar(&g_cvar_hide_knife);
     g_RegisterCvar(&g_cvar_hide_entities);
     g_RegisterCvar(&g_cvar_showfps);
+    g_RegisterCvar(&g_cvar_anti_drug);
   }
 
   // Register +strafe_boost / -strafe_boost commands
@@ -3074,6 +3089,8 @@ DWORD WINAPI MainThread(LPVOID) {
               "  hide_entities <0/1> - Hide Non Solid Map Entities\n");
           ((void (*)(const char *, ...))g_pfnConPrintf)(
               "  showfps <0/1>       - Toggle Real FPS Counter\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  anti_drug <0/1>     - Block server drug effects (FOV > 90)\n");
           ((void (*)(const char *, ...))g_pfnConPrintf)(
               "  +strafe_boost       - Hold to auto-perfect air acceleration\n");
           ((void (*)(const char *, ...))g_pfnConPrintf)(
