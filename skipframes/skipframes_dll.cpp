@@ -41,16 +41,6 @@ BYTE g_Orig_Vol[5];
 #define LogDebug(...) ((void)0)
 #else
 void Log(const char *fmt, ...) {
-  char buf[2048];
-  va_list ap;
-  va_start(ap, fmt);
-  vsnprintf(buf, sizeof(buf) - 1, fmt, ap);
-  va_end(ap);
-  buf[sizeof(buf) - 1] = 0;
-  OutputDebugStringA(buf);
-}
-
-void LogDebug(const char *fmt, ...) {
   char buf[4096];
   va_list ap;
   va_start(ap, fmt);
@@ -59,6 +49,7 @@ void LogDebug(const char *fmt, ...) {
   buf[sizeof(buf) - 1] = 0;
   OutputDebugStringA(buf);
 }
+#define LogDebug Log
 #endif
 
 // -------------------------------------------------------------
@@ -112,6 +103,11 @@ bool g_StrafeBoostActive = false;
 void Cmd_StrafeBoost_On() { g_StrafeBoostActive = true; }
 void Cmd_StrafeBoost_Off() { g_StrafeBoostActive = false; }
 
+// [NEW] +auto_bhop Engine Command
+bool g_AutoBhopActive = false;
+void Cmd_AutoBhop_On() { g_AutoBhopActive = true; }
+void Cmd_AutoBhop_Off() { g_AutoBhopActive = false; }
+
 // CL_CreateMove hook globals
 typedef void (__cdecl *HUD_CL_CreateMove_t)(float, void *, int);
 HUD_CL_CreateMove_t g_Original_CL_CreateMove = nullptr;
@@ -119,9 +115,12 @@ DWORD g_CL_CreateMove_Addr = 0;
 BYTE g_Orig_CL_CreateMove[6] = {0};
 
 #define M_PI_F 3.14159265358979323846f
-#define IN_JUMP (1 << 1)
+#define IN_JUMP  (1 << 1)
+#define IN_DUCK  (1 << 2)
+#define FL_ONGROUND (1 << 9)
 
-// ESP Globals
+// Player flags from playermove_s (for ground detection)
+int g_PlayerFlags = 0;
 int g_PlayerTeam[33] = {0}; // 0=Unknown, 1=T, 2=CT
 
 // TriAPI WorldToScreen (built-in engine W2S)
@@ -235,22 +234,6 @@ InitiateGameConnection_t g_Original_Initiate = nullptr;
 // -------------------------------------------------------------
 // ENGINE TABLE
 // -------------------------------------------------------------
-typedef struct cl_enginefuncs_s {
-  // 0-5
-  void *pfnSPR_Load;
-  void *pfnSPR_Frames;
-  void *pfnSPR_Height;
-  void *pfnSPR_Width;
-  void *pfnSPR_Set;
-  void *pfnSPR_Draw;
-  // 6
-  void *pfnSPR_DrawHoles;
-  void *pfnDrawGeneric; // Index 7? Wait, ClientCmd is 6?
-                        // Let's use void* array for safety and cast later
-                        // Standard SDK: ClientCmd is index 6?
-                        // Let's define it as array of void*
-} cl_enginefuncs_t;
-
 // Global pointer to the engine table (array of void*)
 void **g_EngineTable = nullptr;
 
@@ -262,7 +245,6 @@ void **g_EngineTable = nullptr;
 // [51] GetLocalPlayer    [53] GetEntityByIndex
 // [82] pTriAPI (struct with WorldToScreen at offset 48)
 // We will use a raw pointer table.
-void **g_peengfuncs = nullptr;
 
 // Helpers to call engine functions
 typedef void (*DrawSetTextColor_t)(float r, float g, float b);
@@ -289,8 +271,7 @@ struct SCREENINFO {
 };
 typedef void (*GetScreenInfo_t)(SCREENINFO *pscrinfo);
 GetScreenInfo_t g_pfnGetScreenInfo = nullptr;
-int g_ScrWidth = 0;
-int g_ScrHeight = 0;
+
 
 // [NEW] FPS Counter Globals
 extern "C" volatile int g_SkipVal;
@@ -354,17 +335,6 @@ struct cl_entity_t {
 // -------------------------------------------------------------
 // HOOK TYPEDEFS
 // -------------------------------------------------------------
-// Helper to check if buffer contains string safely
-bool MemContains(void *ptr, int size, const char *str) {
-  if (!ptr || IsBadReadPtr(ptr, size))
-    return false;
-  int len = strlen(str);
-  for (int i = 0; i < size - len; i++) {
-    if (memcmp((char *)ptr + i, str, len) == 0)
-      return true;
-  }
-  return false;
-}
 
 // [NEW] UserMsg Hook (Blind Dump + Keyword Scan)
 typedef void (*UserMsg_t)(void *, void *, void *);
@@ -474,6 +444,7 @@ void Hook_HUD_PlayerMove(void *ppmove, int server) {
     g_TrueEngineVelocity[0] = *(float *)((char *)ppmove + 92);
     g_TrueEngineVelocity[1] = *(float *)((char *)ppmove + 96);
     g_TrueEngineVelocity[2] = *(float *)((char *)ppmove + 100);
+    g_PlayerFlags = *(int *)((char *)ppmove + 184); // flags (FL_ONGROUND etc.)
   }
 
   // Hook back IN
@@ -685,31 +656,7 @@ void *__cdecl Hook_R_TempSprite(float *pos, float *dir, float scale,
                                 float a, float life, int flags) {
   // Lazy-load smoke sprites if not loaded yet (e.g. if InstallHooks ran
   // before map load)
-  if (g_NumSmokeModels <= 0 && g_pfnSPR_Load) {
-    static bool triedLoading = false;
-    if (!triedLoading) {
-      triedLoading = true;
-      LogDebug("[NoSmoke] Lazy-loading smoke sprites...\n");
-      const char *smokeSprites[] = {
-          "sprites/gas_puff_01.spr",  "sprites/smokepuff.spr",
-          "sprites/smoke.spr",        "sprites/black_smoke1.spr",
-          "sprites/black_smoke4.spr", "sprites/steam1.spr"};
-      for (int i = 0; i < 6 && g_NumSmokeModels < MAX_SMOKE_MODELS; i++) {
-        int idx = g_pfnSPR_Load(smokeSprites[i]);
-        if (idx > 0) {
-          g_SmokeModelIndices[g_NumSmokeModels++] = idx;
-          LogDebug("[NoSmoke] Loaded %s -> handle %d\n", smokeSprites[i], idx);
-        } else {
-          LogDebug("[NoSmoke] Failed to load %s\n", smokeSprites[i]);
-        }
-      }
-      
-      // Load crosshair sprites
-      g_CrosshairsSpriteID = g_pfnSPR_Load("sprites/crosshairs.spr");
-      g_CrosshairSpriteID = g_pfnSPR_Load("sprites/crosshair.spr");
-      g_SniperScopeSpriteID = g_pfnSPR_Load("sprites/sniper_scope.spr");
-    }
-  }
+  EnsureSmokeModelsLoaded();
 
   // Debug Logging: Log first few calls to see what's happening
   static int debugLogCount = 0;
@@ -763,10 +710,8 @@ int __cdecl MsgFunc_SayText(const char *pszName, int iSize, void *pbuf) {
           strncpy(temp, &pData[i], 255);
           temp[255] = 0;
 
-          // Send to SayiBilen (no debug log)
-
           // Send to SayiBilen
-          SayiBilen_OnMessage(temp); // This is INSTANT!
+          SayiBilen_OnMessage(temp);
 
           // Move index to skip this string
           i += len;
@@ -1068,8 +1013,7 @@ void FindEngineFunctions() {
   }
 
   // Step 4: Extract functions (indices from Half-Life SDK cdll_int.h)
-  g_peengfuncs = engineTable;
-  g_EngineTable = engineTable; // CRITICAL FIX: Set global table pointer!
+  g_EngineTable = engineTable;
 
   g_pfnHookUserMsg = (pfnHookUserMsg_t)engineTable[18];
   LogDebug("[ProScanner] pfnHookUserMsg [18] = 0x%X\n",
@@ -2393,17 +2337,28 @@ void __cdecl Hook_CL_CreateMove(float frametime, void *cmd, int active) {
 
   g_Original_CL_CreateMove(frametime, cmd, active);
 
+  // --- Auto Bunny Hop (Crouch-Bhop Style) ---
+  if (cmd && active && g_AutoBhopActive) {
+    unsigned short *pButtons = (unsigned short *)((char *)cmd + 30);
+    bool onGround = (g_PlayerFlags & FL_ONGROUND) != 0;
+
+    if (onGround) {
+      // Landing frame: JUMP + release duck
+      *pButtons |= IN_JUMP;
+      *pButtons &= ~IN_DUCK;
+    } else {
+      // Airborne: hold DUCK (pull legs up) + release JUMP
+      *pButtons |= IN_DUCK;
+      *pButtons &= ~IN_JUMP;
+    }
+  }
+
+  // --- Strafe Boost ---
   if (cmd && active && g_StrafeBoostActive) {
-    // Check if player is in the air using velocity Z component
-    // If Z velocity is non-zero OR very small, player is likely airborne
-    // Also works during bhop since you're never truly grounded between hops
     float vz = g_TrueEngineVelocity[2];
     float vx = g_TrueEngineVelocity[0];
     float vy = g_TrueEngineVelocity[1];
     float speed2D = sqrtf(vx * vx + vy * vy);
-
-    // Consider "in air" if: Z velocity is non-zero (falling/rising)
-    // OR if moving fast enough that strafe optimization helps
     bool isInAir = (vz > 1.0f || vz < -1.0f) || speed2D > 100.0f;
 
     if (isInAir) {
@@ -3020,7 +2975,9 @@ DWORD WINAPI MainThread(LPVOID) {
   if (g_pfnAddCommand) {
     g_pfnAddCommand((char *)"+strafe_boost", Cmd_StrafeBoost_On);
     g_pfnAddCommand((char *)"-strafe_boost", Cmd_StrafeBoost_Off);
-    LogDebug("[StrafeBoost] +strafe_boost commands registered safely in MainThread!\n");
+    g_pfnAddCommand((char *)"+auto_bhop", Cmd_AutoBhop_On);
+    g_pfnAddCommand((char *)"-auto_bhop", Cmd_AutoBhop_Off);
+    LogDebug("[Commands] +strafe_boost and +auto_bhop registered!\n");
   }
 
   InstallHooks();
@@ -3093,6 +3050,8 @@ DWORD WINAPI MainThread(LPVOID) {
               "  anti_drug <0/1>     - Block server drug effects (FOV > 90)\n");
           ((void (*)(const char *, ...))g_pfnConPrintf)(
               "  +strafe_boost       - Hold to auto-perfect air acceleration\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  +auto_bhop          - Hold to auto crouch-jump on landing\n");
           ((void (*)(const char *, ...))g_pfnConPrintf)(
               "  F11                 - Toggle Stealth (Freeze-Patch-Thaw)\n");
           ((void (*)(const char *, ...))g_pfnConPrintf)(
