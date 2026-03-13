@@ -56,67 +56,194 @@ DWORD GetProcessIdByName(const char *processName) {
 }
 
 // ============================================
-// STANDARD INJECTION
+// MANUAL MAPPING INJECTION
 // ============================================
 
-bool DropFile(const char *path, const unsigned char *data, size_t size) {
-  Log("[*] Dropping DLL to: %s\n", path);
-  FILE *f = fopen(path, "wb");
-  if (!f) {
-    Log("[!] Failed to write file (Access Denied?)\n");
-    return false;
+typedef HMODULE(__stdcall *pLoadLibraryA)(const char *);
+typedef FARPROC(__stdcall *pGetProcAddress)(HMODULE, const char *);
+typedef BOOL(__stdcall *pDllMain)(HINSTANCE, DWORD, LPVOID);
+
+struct ManualMappingData {
+  pLoadLibraryA fnLoadLibraryA;
+  pGetProcAddress fnGetProcAddress;
+  BYTE *pBase;
+};
+
+// Disable compiler optimizations for the shellcode so GCC doesn't 
+// move constants or strings to .rdata out of our injected function block.
+#pragma GCC push_options
+#pragma GCC optimize ("O0")
+
+// Shellcode executed in the target process
+DWORD __stdcall LibraryLoader(ManualMappingData *pData) {
+  if (!pData || !pData->pBase) return 0;
+
+  BYTE *pBase = pData->pBase;
+  IMAGE_DOS_HEADER *pDos = (IMAGE_DOS_HEADER *)pBase;
+  IMAGE_NT_HEADERS *pNt = (IMAGE_NT_HEADERS *)(pBase + pDos->e_lfanew);
+
+  // 1. Resolve Imports
+  IMAGE_DATA_DIRECTORY *pImportDir = &pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+  if (pImportDir->Size) {
+    IMAGE_IMPORT_DESCRIPTOR *pImportDesc = (IMAGE_IMPORT_DESCRIPTOR *)(pBase + pImportDir->VirtualAddress);
+    while (pImportDesc->Name) {
+      char *szMod = (char *)(pBase + pImportDesc->Name);
+      HMODULE hMod = pData->fnLoadLibraryA(szMod);
+
+      IMAGE_THUNK_DATA *pNameRef = pImportDesc->OriginalFirstThunk ? 
+                                   (IMAGE_THUNK_DATA *)(pBase + pImportDesc->OriginalFirstThunk) : 
+                                   (IMAGE_THUNK_DATA *)(pBase + pImportDesc->FirstThunk);
+      IMAGE_THUNK_DATA *pFuncRef = (IMAGE_THUNK_DATA *)(pBase + pImportDesc->FirstThunk);
+
+      while (pNameRef->u1.AddressOfData) {
+        if (IMAGE_SNAP_BY_ORDINAL(pNameRef->u1.Ordinal)) {
+          pFuncRef->u1.Function = (DWORD)pData->fnGetProcAddress(hMod, (char *)(pNameRef->u1.Ordinal & 0xFFFF));
+        } else {
+          IMAGE_IMPORT_BY_NAME *pImport = (IMAGE_IMPORT_BY_NAME *)(pBase + pNameRef->u1.AddressOfData);
+          pFuncRef->u1.Function = (DWORD)pData->fnGetProcAddress(hMod, (char *)pImport->Name);
+        }
+        pNameRef++;
+        pFuncRef++;
+      }
+      pImportDesc++;
+    }
   }
-  fwrite(data, 1, size, f);
-  fclose(f);
-  return true;
+
+  // 2. Process Relocations
+  IMAGE_DATA_DIRECTORY *pRelocDir = &pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+  if (pRelocDir->Size) {
+    DWORD delta = (DWORD)pBase - pNt->OptionalHeader.ImageBase;
+    if (delta != 0) {
+      IMAGE_BASE_RELOCATION *pReloc = (IMAGE_BASE_RELOCATION *)(pBase + pRelocDir->VirtualAddress);
+      while (pReloc->VirtualAddress) {
+        DWORD count = (pReloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+        WORD *pList = (WORD *)(pReloc + 1);
+        for (DWORD i = 0; i < count; i++) {
+          if (pList[i]) {
+            DWORD *pPatch = (DWORD *)(pBase + pReloc->VirtualAddress + (pList[i] & 0xFFF));
+            *pPatch += delta;
+          }
+        }
+        pReloc = (IMAGE_BASE_RELOCATION *)((BYTE *)pReloc + pReloc->SizeOfBlock);
+      }
+    }
+  }
+
+  // 3. Execute TLS Callbacks (CRITICAL FOR MINGW/C++ DLLs)
+  IMAGE_DATA_DIRECTORY *pTlsDir = &pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+  if (pTlsDir->Size) {
+    IMAGE_TLS_DIRECTORY *pTls = (IMAGE_TLS_DIRECTORY *)(pBase + pTlsDir->VirtualAddress);
+    if (pTls->AddressOfCallBacks) {
+      PIMAGE_TLS_CALLBACK *pCallback = (PIMAGE_TLS_CALLBACK *)pTls->AddressOfCallBacks;
+      while (*pCallback) {
+        (*pCallback)((LPVOID)pBase, DLL_PROCESS_ATTACH, NULL);
+        pCallback++;
+      }
+    }
+  }
+
+  // 4. Call DllMain
+  if (pNt->OptionalHeader.AddressOfEntryPoint) {
+    pDllMain EntryPoint = (pDllMain)(pBase + pNt->OptionalHeader.AddressOfEntryPoint);
+    return EntryPoint((HINSTANCE)pBase, DLL_PROCESS_ATTACH, NULL);
+  }
+  return 1;
 }
 
-bool InjectStandard(DWORD pid, const char *dllPath) {
+DWORD __stdcall LibraryLoaderEnd() { return 0; }
+#pragma GCC pop_options
+
+bool InjectManualMap(DWORD pid, const unsigned char *pRawData) {
+  IMAGE_DOS_HEADER *pDos = (IMAGE_DOS_HEADER *)pRawData;
+  if (pDos->e_magic != IMAGE_DOS_SIGNATURE) {
+    Log("[!] Invalid DOS signature\n");
+    return false;
+  }
+
+  IMAGE_NT_HEADERS *pNt = (IMAGE_NT_HEADERS *)(pRawData + pDos->e_lfanew);
+  if (pNt->Signature != IMAGE_NT_SIGNATURE) {
+    Log("[!] Invalid NT signature\n");
+    return false;
+  }
+
   HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
   if (!hProc) {
     Log("[!] Failed to open process (Error: %d)\n", GetLastError());
     return false;
   }
 
-  Log("[*] Process Opened. Allocating path memory...\n");
-  void *pRemotePath = VirtualAllocEx(hProc, NULL, strlen(dllPath) + 1,
-                                     MEM_COMMIT, PAGE_READWRITE);
-  if (!pRemotePath) {
-    Log("[!] VirtualAllocEx failed\n");
+  Log("[*] Allocating memory in target process...\n");
+  BYTE *pTargetBase = (BYTE *)VirtualAllocEx(hProc, NULL, pNt->OptionalHeader.SizeOfImage,
+                                             MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+
+  if (!pTargetBase) {
+    Log("[!] Failed to allocate image memory\n");
     CloseHandle(hProc);
     return false;
   }
 
-  WriteProcessMemory(hProc, pRemotePath, dllPath, strlen(dllPath) + 1, NULL);
+  Log("[*] Copying headers...\n");
+  WriteProcessMemory(hProc, pTargetBase, pRawData, pNt->OptionalHeader.SizeOfHeaders, NULL);
 
-  Log("[*] Finding LoadLibraryA...\n");
-  HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
-  void *pLoadLibrary = (void *)GetProcAddress(hKernel32, "LoadLibraryA");
+  Log("[*] Copying sections...\n");
+  IMAGE_SECTION_HEADER *pSection = IMAGE_FIRST_SECTION(pNt);
+  for (int i = 0; i < pNt->FileHeader.NumberOfSections; i++) {
+    if (pSection[i].SizeOfRawData) {
+      WriteProcessMemory(hProc, pTargetBase + pSection[i].VirtualAddress,
+                         pRawData + pSection[i].PointerToRawData, pSection[i].SizeOfRawData, NULL);
+    }
+  }
 
-  Log("[*] Creating Remote Thread...\n");
-  HANDLE hThread =
-      CreateRemoteThread(hProc, NULL, 0, (LPTHREAD_START_ROUTINE)pLoadLibrary,
-                         pRemotePath, 0, NULL);
+  Log("[*] Injecting loader shellcode...\n");
+  ManualMappingData data = {0};
+  HMODULE hK32 = GetModuleHandleA("kernel32.dll");
+  if (!hK32) {
+    Log("[!] Could not get kernel32.dll handle\n");
+    VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
+    CloseHandle(hProc);
+    return false;
+  }
+
+  data.fnLoadLibraryA = (pLoadLibraryA)GetProcAddress(hK32, "LoadLibraryA");
+  data.fnGetProcAddress = (pGetProcAddress)GetProcAddress(hK32, "GetProcAddress");
+  data.pBase = pTargetBase;
+
+  BYTE *pTargetData = (BYTE *)VirtualAllocEx(hProc, NULL, sizeof(ManualMappingData),
+                                             MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+  WriteProcessMemory(hProc, pTargetData, &data, sizeof(data), NULL);
+
+  DWORD shellcodeSize = (DWORD)LibraryLoaderEnd - (DWORD)LibraryLoader;
+  BYTE *pTargetShellcode = (BYTE *)VirtualAllocEx(hProc, NULL, shellcodeSize,
+                                                  MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+  WriteProcessMemory(hProc, pTargetShellcode, (void *)LibraryLoader, shellcodeSize, NULL);
+
+  Log("[*] Executing shellcode...\n");
+  HANDLE hThread = CreateRemoteThread(hProc, NULL, 0, (LPTHREAD_START_ROUTINE)pTargetShellcode,
+                                      pTargetData, 0, NULL);
+
   if (!hThread) {
-    Log("[!] CreateRemoteThread failed (Error: %d)\n", GetLastError());
-    VirtualFreeEx(hProc, pRemotePath, 0, MEM_RELEASE);
+    Log("[!] Failed to create remote thread\n");
+    VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
+    VirtualFreeEx(hProc, pTargetData, 0, MEM_RELEASE);
+    VirtualFreeEx(hProc, pTargetShellcode, 0, MEM_RELEASE);
     CloseHandle(hProc);
     return false;
   }
 
-  Log("[+] Injection Thread Started! Waiting for return...\n");
+  Log("[+] Remote thread spawned! Waiting for loader...\n");
   WaitForSingleObject(hThread, INFINITE);
 
   DWORD exitCode = 0;
   GetExitCodeThread(hThread, &exitCode);
-  Log("[+] Thread exited with code: 0x%X (HMODULE)\n", exitCode);
+  Log("[+] Loader returned: %d\n", exitCode);
 
   CloseHandle(hThread);
-  VirtualFreeEx(hProc, pRemotePath, 0, MEM_RELEASE);
+  VirtualFreeEx(hProc, pTargetData, 0, MEM_RELEASE);
+  VirtualFreeEx(hProc, pTargetShellcode, 0, MEM_RELEASE);
   CloseHandle(hProc);
 
   if (exitCode == 0) {
-    Log("[!] LoadLibrary failed in remote process (returned NULL)\n");
+    Log("[!] Manual map loader failed internally!\n");
     return false;
   }
 
@@ -130,6 +257,7 @@ bool InjectStandard(DWORD pid, const char *dllPath) {
 int main() {
   Log("==========================================\n");
   Log("              SkipFrames\n");
+  Log("         (Memory Mapped Edition)\n");
   Log("==========================================\n");
 
   Log("[*] Waiting for hl.exe...\n");
@@ -144,20 +272,8 @@ int main() {
 
   Log("[+] Found hl.exe (PID: %d)\n", pid);
 
-  char tempPath[MAX_PATH];
-  GetTempPathA(MAX_PATH, tempPath);
-  strcat(tempPath, "skipframes-v1.8.0.dll");
-
-  // 1. Drop DLL
-  if (!DropFile(tempPath, g_DllData, g_DllSize)) {
-    Log("[!] Critical: Could not drop DLL.\n");
-    system("pause");
-    return 1;
-  }
-
-  // 2. Inject
-  if (InjectStandard(pid, tempPath)) {
-    Log("\n[SUCCESS] Injected!\n");
+  if (InjectManualMap(pid, g_DllData)) {
+    Log("\n[SUCCESS] Memory Mapped Injected!\n");
     Log("--- Commands ---\n");
     Log("  sf_help <0/1>       - Show Help Menu in-game\n");
     Log("--------------------\n");
