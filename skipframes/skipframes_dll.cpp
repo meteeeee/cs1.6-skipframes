@@ -95,6 +95,7 @@ cvar_t g_cvar_hide_knife = {"hide_knife", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_hide_entities = {"hide_entities", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_anti_drug = {"anti_drug", "1", 0, 1.0f, nullptr};
 cvar_t g_cvar_strafe_helper = {"strafe_helper", "0", 0, 0.0f, nullptr};
+cvar_t g_cvar_sgs = {"sgs", "0", 0, 0.0f, nullptr};
 
 // [NEW] +strafe_boost Engine Command
 typedef int (*AddCommand_t)(char *, void (*)());
@@ -2419,7 +2420,7 @@ void __cdecl Hook_CL_CreateMove(float frametime, void *cmd, int active) {
     }
 
     // --- Ground Strafe (SGS) ---
-    if (g_SGSActive) {
+    if (g_SGSActive && g_cvar_sgs.value >= 1.0f) {
       static bool s_did_duck = false;
       bool onGround = (g_PlayerFlags & FL_ONGROUND) != 0;
 
@@ -2431,6 +2432,11 @@ void __cdecl Hook_CL_CreateMove(float frametime, void *cmd, int active) {
           *pButtons &= ~IN_DUCK;
           s_did_duck = false;
         }
+      }
+
+      // RAGE MODE (sgs 2): Add Air Strafe Boost
+      if (g_cvar_sgs.value >= 2.0f) {
+        ApplyStrafeHelper(cmd);
       }
     }
   }
@@ -3039,6 +3045,7 @@ DWORD WINAPI MainThread(LPVOID) {
     g_RegisterCvar(&g_cvar_showfps);
     g_RegisterCvar(&g_cvar_anti_drug);
     g_RegisterCvar(&g_cvar_strafe_helper);
+    g_RegisterCvar(&g_cvar_sgs);
   }
 
   // Register +strafe_boost / -strafe_boost commands
@@ -3126,6 +3133,10 @@ DWORD WINAPI MainThread(LPVOID) {
               "  +strafe_boost       - Hold to auto-perfect air acceleration\n");
           ((void (*)(const char *, ...))g_pfnConPrintf)(
               "  +auto_bhop          - Hold to auto crouch-jump on landing\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  +sgs                - Hold to auto Ground-Strafe (sgs 1/2)\n");
+          ((void (*)(const char *, ...))g_pfnConPrintf)(
+              "  sgs <0/1/2>         - 0=Off 1=Legit 2=Rage (with boost)\n");
           ((void (*)(const char *, ...))g_pfnConPrintf)(
               "  F11                 - Toggle Stealth (Freeze-Patch-Thaw)\n");
           ((void (*)(const char *, ...))g_pfnConPrintf)(
