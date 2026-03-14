@@ -108,6 +108,11 @@ bool g_AutoBhopActive = false;
 void Cmd_AutoBhop_On() { g_AutoBhopActive = true; }
 void Cmd_AutoBhop_Off() { g_AutoBhopActive = false; }
 
+// [NEW] +sgs Engine Command
+bool g_SGSActive = false;
+void Cmd_SGS_On() { g_SGSActive = true; }
+void Cmd_SGS_Off() { g_SGSActive = false; }
+
 // CL_CreateMove hook globals
 typedef void (__cdecl *HUD_CL_CreateMove_t)(float, void *, int);
 HUD_CL_CreateMove_t g_Original_CL_CreateMove = nullptr;
@@ -2336,33 +2341,52 @@ void __cdecl Hook_CL_CreateMove(float frametime, void *cmd, int active) {
   VirtualProtect((void *)g_CL_CreateMove_Addr, 10, old, &old);
 
   g_Original_CL_CreateMove(frametime, cmd, active);
-
-  // --- Auto Bunny Hop (Crouch-Bhop Style) ---
-  if (cmd && active && g_AutoBhopActive) {
+  
+  if (cmd && active) {
     unsigned short *pButtons = (unsigned short *)((char *)cmd + 30);
-    bool onGround = (g_PlayerFlags & FL_ONGROUND) != 0;
 
-    if (onGround) {
-      // Landing frame: JUMP + release duck
-      *pButtons |= IN_JUMP;
-      *pButtons &= ~IN_DUCK;
-    } else {
-      // Airborne: hold DUCK (pull legs up) + release JUMP
-      *pButtons |= IN_DUCK;
-      *pButtons &= ~IN_JUMP;
+    // --- Auto Bunny Hop (Crouch-Bhop Style) ---
+    if (g_AutoBhopActive) {
+      bool onGround = (g_PlayerFlags & FL_ONGROUND) != 0;
+
+      if (onGround) {
+        // Landing frame: JUMP + release duck
+        *pButtons |= IN_JUMP;
+        *pButtons &= ~IN_DUCK;
+      } else {
+        // Airborne: hold DUCK (pull legs up) + release JUMP
+        *pButtons |= IN_DUCK;
+        *pButtons &= ~IN_JUMP;
+      }
     }
-  }
 
-  // --- Strafe Boost ---
-  if (cmd && active && g_StrafeBoostActive) {
-    float vz = g_TrueEngineVelocity[2];
-    float vx = g_TrueEngineVelocity[0];
-    float vy = g_TrueEngineVelocity[1];
-    float speed2D = sqrtf(vx * vx + vy * vy);
-    bool isInAir = (vz > 1.0f || vz < -1.0f) || speed2D > 100.0f;
+    // --- Strafe Boost ---
+    if (g_StrafeBoostActive) {
+      float vz = g_TrueEngineVelocity[2];
+      float vx = g_TrueEngineVelocity[0];
+      float vy = g_TrueEngineVelocity[1];
+      float speed2D = sqrtf(vx * vx + vy * vy);
+      bool isInAir = (vz > 1.0f || vz < -1.0f) || speed2D > 100.0f;
 
-    if (isInAir) {
-      ApplyStrafeHelper(cmd);
+      if (isInAir) {
+        ApplyStrafeHelper(cmd);
+      }
+    }
+
+    // --- Ground Strafe (SGS) ---
+    if (g_SGSActive) {
+      static bool s_did_duck = false;
+      bool onGround = (g_PlayerFlags & FL_ONGROUND) != 0;
+
+      if (onGround && !s_did_duck) {
+        *pButtons |= IN_DUCK;
+        s_did_duck = true;
+      } else {
+        if (s_did_duck) {
+          *pButtons &= ~IN_DUCK;
+          s_did_duck = false;
+        }
+      }
     }
   }
 
@@ -2977,7 +3001,9 @@ DWORD WINAPI MainThread(LPVOID) {
     g_pfnAddCommand((char *)"-strafe_boost", Cmd_StrafeBoost_Off);
     g_pfnAddCommand((char *)"+auto_bhop", Cmd_AutoBhop_On);
     g_pfnAddCommand((char *)"-auto_bhop", Cmd_AutoBhop_Off);
-    LogDebug("[Commands] +strafe_boost and +auto_bhop registered!\n");
+    g_pfnAddCommand((char *)"+sgs", Cmd_SGS_On);
+    g_pfnAddCommand((char *)"-sgs", Cmd_SGS_Off);
+    LogDebug("[Commands] +strafe_boost, +auto_bhop, +sgs, and -sgs registered!\n");
   }
 
   InstallHooks();
