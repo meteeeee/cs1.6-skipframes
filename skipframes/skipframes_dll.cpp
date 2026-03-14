@@ -94,6 +94,7 @@ cvar_t g_cvar_speedometer_color = {"speedometer_color", "0 255 255", 0, 0.0f,
 cvar_t g_cvar_hide_knife = {"hide_knife", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_hide_entities = {"hide_entities", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_anti_drug = {"anti_drug", "1", 0, 1.0f, nullptr};
+cvar_t g_cvar_strafe_helper = {"strafe_helper", "0", 0, 0.0f, nullptr};
 
 // [NEW] +strafe_boost Engine Command
 typedef int (*AddCommand_t)(char *, void (*)());
@@ -112,6 +113,9 @@ void Cmd_AutoBhop_Off() { g_AutoBhopActive = false; }
 bool g_SGSActive = false;
 void Cmd_SGS_On() { g_SGSActive = true; }
 void Cmd_SGS_Off() { g_SGSActive = false; }
+bool g_StrafeHelperActive = false;
+void Cmd_StrafeHelper_On() { g_StrafeHelperActive = true; }
+void Cmd_StrafeHelper_Off() { g_StrafeHelperActive = false; }
 
 // CL_CreateMove hook globals
 typedef void (__cdecl *HUD_CL_CreateMove_t)(float, void *, int);
@@ -2329,6 +2333,26 @@ static void ApplyStrafeHelper(void *cmd) {
 }
 
 // -------------------------------------------------------------
+// Mode 1: Legit (Mouse turn -> A/D)
+// Mode 2: Hybrid (Legit + Rage Boost)
+// -------------------------------------------------------------
+static void ApplyStrafeHelperLegit(void *cmd, float deltaYaw, int mode) {
+  if (!cmd) return;
+  float *pSideMove = (float *)((char *)cmd + 20);
+
+  if (fabsf(deltaYaw) < 0.1f) return;
+  float mouseDir = (deltaYaw < 0.0f) ? 1.0f : -1.0f;
+
+  if (mode == 1 || mode == 2) {
+    *pSideMove = mouseDir * 400.0f; // LEGIT: Sync keys to mouse
+  }
+
+  if (mode == 2) {
+    ApplyStrafeHelper(cmd); // HYBRID: Add rage boost on top
+  }
+}
+
+// -------------------------------------------------------------
 // +strafe_boost: CL_CreateMove Hook
 // -------------------------------------------------------------
 void __cdecl Hook_CL_CreateMove(float frametime, void *cmd, int active) {
@@ -2344,6 +2368,15 @@ void __cdecl Hook_CL_CreateMove(float frametime, void *cmd, int active) {
   
   if (cmd && active) {
     unsigned short *pButtons = (unsigned short *)((char *)cmd + 30);
+    float *pViewAngles = (float *)((char *)cmd + 4);
+
+    // Track Mouse Delta
+    static float s_lastYaw = 0.0f;
+    float currentYaw = pViewAngles[1];
+    float deltaYaw = currentYaw - s_lastYaw;
+    while (deltaYaw > 180.0f) deltaYaw -= 360.0f;
+    while (deltaYaw < -180.0f) deltaYaw += 360.0f;
+    s_lastYaw = currentYaw;
 
     // --- Auto Bunny Hop (Crouch-Bhop Style) ---
     if (g_AutoBhopActive) {
@@ -2360,8 +2393,8 @@ void __cdecl Hook_CL_CreateMove(float frametime, void *cmd, int active) {
       }
     }
 
-    // --- Strafe Boost ---
-    if (g_StrafeBoostActive) {
+    // --- Strafe Boost (+strafe_boost) ---
+    if (g_StrafeBoostActive && g_cvar_strafe_helper.value < 1.0f) {
       float vz = g_TrueEngineVelocity[2];
       float vx = g_TrueEngineVelocity[0];
       float vy = g_TrueEngineVelocity[1];
@@ -2370,6 +2403,18 @@ void __cdecl Hook_CL_CreateMove(float frametime, void *cmd, int active) {
 
       if (isInAir) {
         ApplyStrafeHelper(cmd);
+      }
+    }
+
+    // --- Strafe Helper (strafe_helper 1/2) ---
+    if (g_StrafeHelperActive && g_cvar_strafe_helper.value >= 1.0f) {
+      float vz = g_TrueEngineVelocity[2];
+      float speed2D = sqrtf(g_TrueEngineVelocity[0] * g_TrueEngineVelocity[0] + 
+                            g_TrueEngineVelocity[1] * g_TrueEngineVelocity[1]);
+      bool isInAir = (vz > 1.0f || vz < -1.0f) || speed2D > 100.0f;
+
+      if (isInAir) {
+        ApplyStrafeHelperLegit(cmd, deltaYaw, (int)g_cvar_strafe_helper.value);
       }
     }
 
@@ -2993,6 +3038,7 @@ DWORD WINAPI MainThread(LPVOID) {
     g_RegisterCvar(&g_cvar_hide_entities);
     g_RegisterCvar(&g_cvar_showfps);
     g_RegisterCvar(&g_cvar_anti_drug);
+    g_RegisterCvar(&g_cvar_strafe_helper);
   }
 
   // Register +strafe_boost / -strafe_boost commands
@@ -3003,6 +3049,8 @@ DWORD WINAPI MainThread(LPVOID) {
     g_pfnAddCommand((char *)"-auto_bhop", Cmd_AutoBhop_Off);
     g_pfnAddCommand((char *)"+sgs", Cmd_SGS_On);
     g_pfnAddCommand((char *)"-sgs", Cmd_SGS_Off);
+    g_pfnAddCommand((char *)"+strafe_helper", Cmd_StrafeHelper_On);
+    g_pfnAddCommand((char *)"-strafe_helper", Cmd_StrafeHelper_Off);
     LogDebug("[Commands] +strafe_boost, +auto_bhop, +sgs, and -sgs registered!\n");
   }
 
