@@ -185,6 +185,10 @@ cvar_t g_cvar_anti_drug = {"anti_drug", "1", 0, 1.0f, nullptr};
 cvar_t g_cvar_strafe_helper = {"strafe_helper", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_sgs = {"sgs", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_cl_antiss = {"anti_ss", "1", 0, 1.0f, nullptr};
+cvar_t g_cvar_null_canceling_movement = {"null_canceling_movement", "0", 0, 0.0f, nullptr};
+cvar_t *g_pCvar_SideSpeed = nullptr;
+cvar_t *g_pCvar_ForwardSpeed = nullptr;
+cvar_t *g_pCvar_BackSpeed = nullptr;
 void Cmd_ShowHelp() {
   if (g_pfnConPrintf) {
     ((void (*)(const char *, ...))g_pfnConPrintf)("--- SkipFrames Commands ---\n");
@@ -247,6 +251,8 @@ void Cmd_ShowHelp() {
     ((void (*)(const char *, ...))g_pfnConPrintf)(
         "  anti_ss <0/1>       - Hide visuals during screenshots\n");
     ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  null_canceling_movement <0/1> - Prevents standing still (Snap Tap)\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
         "  F11                 - Toggle Stealth (Freeze-Patch-Thaw)\n");
     ((void (*)(const char *, ...))g_pfnConPrintf)(
         "--------------------\n");
@@ -283,6 +289,10 @@ BYTE g_Orig_CL_CreateMove[6] = {0};
 #define M_PI_F 3.14159265358979323846f
 #define IN_JUMP  (1 << 1)
 #define IN_DUCK  (1 << 2)
+#define IN_FORWARD (1 << 3)
+#define IN_BACK    (1 << 4)
+#define IN_MOVELEFT (1 << 9)
+#define IN_MOVERIGHT (1 << 10)
 #define FL_ONGROUND (1 << 9)
 
 // Player flags from playermove_s (for ground detection)
@@ -2744,6 +2754,63 @@ void __cdecl Hook_CL_CreateMove(float frametime, void *cmd, int active) {
       }
     }
 
+    // --- Null Cancelling Movement (Snap Tap) ---
+    if (g_cvar_null_canceling_movement.value != 0.0f) {
+        static bool s_wasA = false;
+        static bool s_wasD = false;
+        static bool s_wasW = false;
+        static bool s_wasS = false;
+        static int s_lastSide = 0; // 0=None, 1=Left, 2=Right
+        static int s_lastForward = 0; // 0=None, 1=Forward, 2=Back
+
+        float *pForwardMove = (float *)((char *)cmd + 16);
+        float *pSideMove = (float *)((char *)cmd + 20);
+
+        bool isA = ((*pButtons) & IN_MOVELEFT) != 0;
+        bool isD = ((*pButtons) & IN_MOVERIGHT) != 0;
+        bool isW = ((*pButtons) & IN_FORWARD) != 0;
+        bool isS = ((*pButtons) & IN_BACK) != 0;
+
+        // Lazy load speed cvars
+        if (!g_pCvar_SideSpeed) g_pCvar_SideSpeed = FindCvarByName("cl_sidespeed");
+        if (!g_pCvar_ForwardSpeed) g_pCvar_ForwardSpeed = FindCvarByName("cl_forwardspeed");
+        if (!g_pCvar_BackSpeed) g_pCvar_BackSpeed = FindCvarByName("cl_backspeed");
+
+        float sideSpeed = g_pCvar_SideSpeed ? g_pCvar_SideSpeed->value : 400.0f;
+        float forwardSpeed = g_pCvar_ForwardSpeed ? g_pCvar_ForwardSpeed->value : 400.0f;
+        float backSpeed = g_pCvar_BackSpeed ? g_pCvar_BackSpeed->value : 400.0f;
+
+        // Side Axis
+        if (isA && !s_wasA) s_lastSide = 1;
+        if (isD && !s_wasD) s_lastSide = 2;
+        if (isA && isD) {
+            if (s_lastSide == 1) {
+                *pButtons &= ~IN_MOVERIGHT;
+                *pSideMove = -sideSpeed;
+            } else if (s_lastSide == 2) {
+                *pButtons &= ~IN_MOVELEFT;
+                *pSideMove = sideSpeed;
+            }
+        }
+        s_wasA = isA;
+        s_wasD = isD;
+
+        // Forward Axis
+        if (isW && !s_wasW) s_lastForward = 1;
+        if (isS && !s_wasS) s_lastForward = 2;
+        if (isW && isS) {
+            if (s_lastForward == 1) {
+                *pButtons &= ~IN_BACK;
+                *pForwardMove = forwardSpeed;
+            } else if (s_lastForward == 2) {
+                *pButtons &= ~IN_FORWARD;
+                *pForwardMove = -backSpeed;
+            }
+        }
+        s_wasW = isW;
+        s_wasS = isS;
+    }
+
     // --- Ground Strafe (SGS) ---
     if (g_SGSActive && g_cvar_sgs.value >= 1.0f) {
       static bool s_did_duck = false;
@@ -3371,6 +3438,7 @@ DWORD WINAPI MainThread(LPVOID) {
      g_RegisterCvar(&g_cvar_strafe_helper);
      g_RegisterCvar(&g_cvar_sgs);
      g_RegisterCvar(&g_cvar_cl_antiss);
+     g_RegisterCvar(&g_cvar_null_canceling_movement);
    }
  
    // Register +strafe_boost / -strafe_boost commands
