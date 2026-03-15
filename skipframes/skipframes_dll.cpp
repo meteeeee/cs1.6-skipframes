@@ -3,8 +3,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
-#include <cstring>
 #include <tlhelp32.h>
 #include <windows.h>
 //
@@ -14,7 +12,6 @@
 #define OFF_SCR_UPDATE 0x4C2A0
 
 DWORD g_HwBase = 0;
-DWORD g_ClientBase = 0; // client.dll base address
 DWORD g_SCR = 0;
 DWORD g_CreateInterface = 0;
 DWORD g_SteamInternal = 0;
@@ -23,7 +20,73 @@ DWORD g_JmpTarget = 0;
 
 // [NEW] Engine Functions
 typedef void (*ClientCmd_t)(const char *);
-ClientCmd_t g_pfnClientCmd = nullptr;
+extern ClientCmd_t g_pfnClientCmd;
+typedef void (*ServerCmd_t)(const char *);
+extern ServerCmd_t g_pfnServerCmd;
+
+// [NEW] Command Gateway Hook (Catches ALL commands: console, server, UI)
+typedef void (*Cbuf_AddText_t)(const char *);
+extern Cbuf_AddText_t g_pfnCbuf_AddText;
+
+// CVAR SYSTEM
+typedef struct cvar_s {
+  const char *name;
+  const char *string;
+  int flags;
+  float value;
+  struct cvar_s *next;
+} cvar_t;
+
+typedef void (*Cvar_RegisterVariable_t)(cvar_t *variable);
+extern Cvar_RegisterVariable_t g_RegisterCvar;
+
+// UTILS
+typedef void (*ConPrintf_t)(const char *fmt, ...);
+extern ConPrintf_t g_pfnConPrintf;
+
+// ANTI-SS STATE
+extern cvar_t g_cvar_cl_antiss;
+extern DWORD g_AntiSS_EndTime; 
+extern int g_AntiSS_PendingSnapshot; 
+void TriggerAntiSS();
+
+inline bool ShouldHideVisuals() {
+  return (g_cvar_cl_antiss.value != 0.0f && (GetTickCount() < g_AntiSS_EndTime || g_AntiSS_PendingSnapshot > 0));
+}
+
+void Hook_Cbuf_AddText(const char *szText);
+extern BYTE g_Orig_Cbuf[12];
+
+void Hook_Cbuf_AddText(const char *szText) {
+  // 1. Logic (BEFORE unhooking) - Block if it's a snapshot
+  bool block = false;
+  if (szText && g_cvar_cl_antiss.value != 0.0f) {
+    if (strstr(szText, "snapshot") || strstr(szText, "screenshot") || strstr(szText, "screendump")) {
+        TriggerAntiSS();
+        g_AntiSS_PendingSnapshot = 15; // Wait 15 frames (very safe)
+        block = true;
+    }
+  }
+
+  if (block) return; // DON'T call original
+
+  // 2. Unhook
+  if (g_pfnCbuf_AddText)
+    memcpy((void *)g_pfnCbuf_AddText, g_Orig_Cbuf, 6);
+
+  // 3. Call Original
+  if (g_pfnCbuf_AddText)
+    g_pfnCbuf_AddText(szText);
+
+  // 4. Rehook
+  if (g_pfnCbuf_AddText) {
+    BYTE patch[5] = {0xE9, 0, 0, 0, 0};
+    *(DWORD *)(patch + 1) = (DWORD)Hook_Cbuf_AddText - (DWORD)g_pfnCbuf_AddText - 5;
+    memcpy((void *)g_pfnCbuf_AddText, patch, 5);
+    *(BYTE *)((DWORD)g_pfnCbuf_AddText + 5) = 0x90;
+  }
+}
+
 
 bool g_HooksActive = false;
 bool g_StealthMode = false;
@@ -90,15 +153,6 @@ inline int GetTeamFromModel(const char *model) {
 // -------------------------------------------------------------
 // CVARS
 // -------------------------------------------------------------
-typedef struct cvar_s {
-  const char *name;
-  const char *string;
-  int flags;
-  float value;
-  struct cvar_s *next;
-} cvar_t;
-
-typedef void (*Cvar_RegisterVariable_t)(cvar_t *variable);
 Cvar_RegisterVariable_t g_RegisterCvar = nullptr;
 
 cvar_t g_cvar_frame_skip = {"frame_skip", "0", 0, 0.0f, nullptr};
@@ -106,6 +160,8 @@ cvar_t g_cvar_change_id = {"change_id", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_sb = {"sb", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_sb_delay = {"sb_delay", "5", 0, 0.0f, nullptr};
 cvar_t g_cvar_sb_range = {"sb_range", "100", 0, 0.0f, nullptr};
+cvar_t g_cvar_no_smoke = {"no_smoke", "1", 0, 1.0f, nullptr};
+cvar_t g_cvar_speedometer = {"speedometer", "1", 0, 1.0f, nullptr};
 cvar_t g_cvar_ct_esp = {"esp_ct", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_t_esp = {"esp_t", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_esp_type = {"esp_type", "3", 0, 0.0f,
@@ -121,9 +177,6 @@ cvar_t g_cvar_ch_thickness = {"ch_thickness", "1", 0, 0.0f, nullptr};
 cvar_t g_cvar_ch_import = {"ch_import", "", 0, 0.0f, nullptr};
 cvar_t g_cvar_ch_export = {"ch_export", "", 0, 0.0f, nullptr};
 // [NEW] Help Command
-cvar_t g_cvar_sf_help = {"sf_help", "0", 0, 0.0f, nullptr};
-cvar_t g_cvar_no_smoke = {"no_smoke", "1", 0, 1.0f, nullptr};
-cvar_t g_cvar_speedometer = {"speedometer", "1", 0, 1.0f, nullptr};
 cvar_t g_cvar_speedometer_color = {"speedometer_color", "0 255 255", 0, 0.0f,
                                    nullptr};
 cvar_t g_cvar_hide_knife = {"hide_knife", "0", 0, 0.0f, nullptr};
@@ -131,6 +184,74 @@ cvar_t g_cvar_hide_entities = {"hide_entities", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_anti_drug = {"anti_drug", "1", 0, 1.0f, nullptr};
 cvar_t g_cvar_strafe_helper = {"strafe_helper", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_sgs = {"sgs", "0", 0, 0.0f, nullptr};
+cvar_t g_cvar_cl_antiss = {"anti_ss", "1", 0, 1.0f, nullptr};
+void Cmd_ShowHelp() {
+  if (g_pfnConPrintf) {
+    ((void (*)(const char *, ...))g_pfnConPrintf)("--- SkipFrames Commands ---\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  frame_skip <value>  - Skip frames (0=Off)\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  change_id <0/1>     - Toggle ID Changer\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  sf_help             - Show Help Menu\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  sb <0/1>            - Toggle SayiBilen (1=Ready)\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  sb_range <N>        - Guess Range (Default: 100)\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  sb_delay <MS>       - Delay in ms (Default: 5)\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  esp_ct <0/1>        - Toggle CT ESP\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  esp_t <0/1>         - Toggle T ESP\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  esp_type <1/2/3>    - 1=Glow 2=Box 3=Both\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  esp_label <0/1>     - Toggle Name+Distance Labels\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  no_smoke <0/1>      - Toggle Smoke Removal\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  ch <0/1>            - Toggle Custom Crosshair\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  ch_color            - RGB color (e.g., \"0 255 0\")\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  ch_length           - Crosshair line length\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  ch_offset           - Crosshair center offset\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  ch_thickness        - Crosshair line thickness\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  ch_import <name>    - Import cstrike/name.txt profile\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  ch_export <name>    - Export cstrike/name.txt profile\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  speedometer <0/1>   - Toggle Speedometer\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  speedometer_color   - RGB color (e.g., \"0 255 255\")\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  hide_knife <0/1>    - Hide Knife Viewmodel\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  hide_entities <0/1> - Hide Non Solid Map Entities\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  showfps <0/1>       - Toggle Real FPS Counter\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  anti_drug <0/1>     - Block server drug effects (FOV > 90)\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  +strafe_boost       - Hold to auto-perfect air acceleration\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  +auto_bhop          - Hold to auto crouch-jump on landing\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  +sgs                - Hold to auto Ground-Strafe (sgs 1/2)\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  sgs <0/1/2>         - 0=Off 1=Legit 2=Rage (with boost)\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  anti_ss <0/1>       - Hide visuals during screenshots\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  F11                 - Toggle Stealth (Freeze-Patch-Thaw)\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "--------------------\n");
+  }
+}
 
 // [NEW] +strafe_boost Engine Command
 typedef int (*AddCommand_t)(char *, void (*)());
@@ -378,6 +499,14 @@ struct cl_entity_t {
 };
 
 // -------------------------------------------------------------
+// ENGINE GLOBAL DEFINITIONS
+// -------------------------------------------------------------
+ClientCmd_t g_pfnClientCmd = nullptr;
+ServerCmd_t g_pfnServerCmd = nullptr;
+Cbuf_AddText_t g_pfnCbuf_AddText = nullptr;
+BYTE g_Orig_Cbuf[12] = {0};
+
+// -------------------------------------------------------------
 // HOOK TYPEDEFS
 // -------------------------------------------------------------
 
@@ -397,6 +526,38 @@ HUD_PlayerMove_t g_Original_HUD_PlayerMove = nullptr;
 DWORD g_HUD_PlayerMove_Addr = 0;
 BYTE g_Orig_HUD_PlayerMove[10];
 float g_TrueEngineVelocity[3] = {0.0f, 0.0f, 0.0f};
+
+// [NEW] Anti-Screenshot (Anti-SS) State
+DWORD g_AntiSS_EndTime = 0;
+int g_AntiSS_PendingSnapshot = 0;
+
+void TriggerAntiSS() {
+    g_AntiSS_EndTime = GetTickCount() + 1500; // Total 1.5s protection
+}
+
+void Hook_ClientCmd(const char *szCmdString) {
+  if (szCmdString && g_cvar_cl_antiss.value != 0.0f) {
+    if (strstr(szCmdString, "snapshot") || strstr(szCmdString, "screenshot") || strstr(szCmdString, "screendump")) {
+        TriggerAntiSS();
+        g_AntiSS_PendingSnapshot = 10;
+        return; // Block
+    }
+  }
+  if (g_pfnClientCmd)
+    g_pfnClientCmd(szCmdString);
+}
+
+void Hook_ServerCmd(const char *szCmdString) {
+  if (szCmdString && g_cvar_cl_antiss.value != 0.0f) {
+    if (strstr(szCmdString, "snapshot") || strstr(szCmdString, "screenshot") || strstr(szCmdString, "screendump")) {
+        TriggerAntiSS();
+        g_AntiSS_PendingSnapshot = 10;
+        return; // Block
+    }
+  }
+  if (g_pfnServerCmd)
+    g_pfnServerCmd(szCmdString);
+}
 
 // --- FindCvarByName: Walk engine cvar linked list (cached, scan once) ---
 cvar_t *FindCvarByName(const char *name) {
@@ -1064,8 +1225,46 @@ void FindEngineFunctions() {
   LogDebug("[ProScanner] pfnHookUserMsg [18] = 0x%X\n",
            (DWORD)g_pfnHookUserMsg);
 
+  g_pfnServerCmd = (ServerCmd_t)engineTable[19];
+  engineTable[19] = (void *)Hook_ServerCmd;
+  LogDebug("[ProScanner] pfnServerCmd [19] hooked (0x%X -> 0x%X)\n", (DWORD)g_pfnServerCmd, (DWORD)Hook_ServerCmd);
+
   g_pfnClientCmd = (ClientCmd_t)engineTable[20];
-  LogDebug("[ProScanner] pfnClientCmd [20] = 0x%X\n", (DWORD)g_pfnClientCmd);
+  
+  // Find Cbuf_AddText by tracing pfnClientCmd (index 20)
+  if (g_pfnClientCmd) {
+    BYTE* code = (BYTE*)g_pfnClientCmd;
+    for (int i=0; i<32; i++) {
+        if (code[i] == 0xE8) { // CALL rel32
+            DWORD offset = *(DWORD*)(code + i + 1);
+            g_pfnCbuf_AddText = (Cbuf_AddText_t)((DWORD)g_pfnClientCmd + i + 5 + offset);
+            LogDebug("[ProScanner] Found Cbuf_AddText at 0x%X via CALL\n", (DWORD)g_pfnCbuf_AddText);
+            break;
+        }
+        if (code[i] == 0xE9) { // JMP rel32
+            DWORD offset = *(DWORD*)(code + i + 1);
+            g_pfnCbuf_AddText = (Cbuf_AddText_t)((DWORD)g_pfnClientCmd + i + 5 + offset);
+            LogDebug("[ProScanner] Found Cbuf_AddText at 0x%X via JMP\n", (DWORD)g_pfnCbuf_AddText);
+            break;
+        }
+    }
+  }
+
+  engineTable[20] = (void *)Hook_ClientCmd; // Hook it
+  LogDebug("[ProScanner] pfnClientCmd [20] hooked (0x%X -> 0x%X)\n", (DWORD)g_pfnClientCmd, (DWORD)Hook_ClientCmd);
+
+  // Apply Cbuf_AddText gateway hook (STUBBORN protection)
+  if (g_pfnCbuf_AddText) {
+      DWORD old;
+      VirtualProtect((void *)g_pfnCbuf_AddText, 10, PAGE_EXECUTE_READWRITE, &old);
+      memcpy(g_Orig_Cbuf, (void *)g_pfnCbuf_AddText, 6);
+      
+      BYTE patch[5] = {0xE9, 0, 0, 0, 0};
+      *(DWORD *)(patch + 1) = (DWORD)Hook_Cbuf_AddText - (DWORD)g_pfnCbuf_AddText - 5;
+      memcpy((void *)g_pfnCbuf_AddText, patch, 5);
+      *(BYTE *)((DWORD)g_pfnCbuf_AddText + 5) = 0x90;
+      LogDebug("[ProScanner] Cbuf_AddText HOOKED!\n");
+  }
 
   g_RegisterCvar = (Cvar_RegisterVariable_t)engineTable[14];
   LogDebug("[ProScanner] pfnRegisterVariable [14] = 0x%X\n",
@@ -1493,6 +1692,10 @@ int __cdecl Hook_StudioDrawPlayer(int flags, void *pplayer) {
   if (!g_Original_StudioDrawPlayer)
     return 0;
 
+  if (ShouldHideVisuals()) {
+    return g_Original_StudioDrawPlayer(flags, pplayer);
+  }
+
   // [Failsafe] If stealth mode is active (hooks removed), stop rendering glow
   // immediately
   if (!g_HooksActive)
@@ -1846,6 +2049,39 @@ int __cdecl Hook_DrawEngine() {
 
 // ===== HUD_REDRAW HOOK (ESP drawing happens here, after 3D world) =====
 int __cdecl Hook_HUD_Redraw(float time, int intermission) {
+  // Anti-Screenshot: Re-issue logic
+  if (g_AntiSS_PendingSnapshot > 0) {
+      g_AntiSS_PendingSnapshot--;
+      if (g_AntiSS_PendingSnapshot == 5) {
+          // Call UNHOOKED buffer to avoid another block
+          if (g_pfnCbuf_AddText) {
+              memcpy((void *)g_pfnCbuf_AddText, g_Orig_Cbuf, 6);
+              g_pfnCbuf_AddText("snapshot\n");
+              // Rehook
+              BYTE patch[5] = {0xE9, 0, 0, 0, 0};
+              *(DWORD *)(patch + 1) = (DWORD)Hook_Cbuf_AddText - (DWORD)g_pfnCbuf_AddText - 5;
+              memcpy((void *)g_pfnCbuf_AddText, patch, 5);
+              *(BYTE *)((DWORD)g_pfnCbuf_AddText + 5) = 0x90;
+          }
+      }
+  }
+
+  // 1. Unhook
+  memcpy((void *)g_HUD_Redraw_Addr, g_Orig_HUD_Redraw, 6);
+
+  // 2. Call Original
+  int res = ((HUD_Redraw_t)g_HUD_Redraw_Addr)(time, intermission);
+
+  // 3. Rehook
+  BYTE patch[5] = {0xE9, 0, 0, 0, 0};
+  *(DWORD *)(patch + 1) = (DWORD)Hook_HUD_Redraw - (DWORD)g_HUD_Redraw_Addr - 5;
+  memcpy((void *)g_HUD_Redraw_Addr, patch, 5);
+  *(BYTE *)((DWORD)g_HUD_Redraw_Addr + 5) = 0x90;
+
+  // 4. Check Anti-SS (Only run our visuals if screen is NOT being captured)
+  if (ShouldHideVisuals()) {
+      return res;
+  }
   // ------------------------------------
   // Update HideWeapon dynamically if 'ch' is toggled
   // ------------------------------------
@@ -3124,22 +3360,23 @@ DWORD WINAPI MainThread(LPVOID) {
     g_RegisterCvar(&g_cvar_ch_offset);
     g_RegisterCvar(&g_cvar_ch_thickness);
     g_RegisterCvar(&g_cvar_ch_import);
-    g_RegisterCvar(&g_cvar_ch_export);
-    g_RegisterCvar(&g_cvar_sf_help);
-    g_RegisterCvar(&g_cvar_no_smoke);
-    g_RegisterCvar(&g_cvar_speedometer);
-    g_RegisterCvar(&g_cvar_speedometer_color);
-    g_RegisterCvar(&g_cvar_hide_knife);
-    g_RegisterCvar(&g_cvar_hide_entities);
-    g_RegisterCvar(&g_cvar_showfps);
-    g_RegisterCvar(&g_cvar_anti_drug);
-    g_RegisterCvar(&g_cvar_strafe_helper);
-    g_RegisterCvar(&g_cvar_sgs);
-  }
-
-  // Register +strafe_boost / -strafe_boost commands
-  if (g_pfnAddCommand) {
-    g_pfnAddCommand((char *)"+strafe_boost", Cmd_StrafeBoost_On);
+     g_RegisterCvar(&g_cvar_ch_export);
+     g_RegisterCvar(&g_cvar_no_smoke);
+     g_RegisterCvar(&g_cvar_speedometer);
+     g_RegisterCvar(&g_cvar_speedometer_color);
+     g_RegisterCvar(&g_cvar_hide_knife);
+     g_RegisterCvar(&g_cvar_hide_entities);
+     g_RegisterCvar(&g_cvar_showfps);
+     g_RegisterCvar(&g_cvar_anti_drug);
+     g_RegisterCvar(&g_cvar_strafe_helper);
+     g_RegisterCvar(&g_cvar_sgs);
+     g_RegisterCvar(&g_cvar_cl_antiss);
+   }
+ 
+   // Register +strafe_boost / -strafe_boost commands
+   if (g_pfnAddCommand) {
+     g_pfnAddCommand((char *)"sf_help", Cmd_ShowHelp);
+     g_pfnAddCommand((char *)"+strafe_boost", Cmd_StrafeBoost_On);
     g_pfnAddCommand((char *)"-strafe_boost", Cmd_StrafeBoost_Off);
     g_pfnAddCommand((char *)"+auto_bhop", Cmd_AutoBhop_On);
     g_pfnAddCommand((char *)"-auto_bhop", Cmd_AutoBhop_Off);
@@ -3166,75 +3403,6 @@ DWORD WINAPI MainThread(LPVOID) {
     }
 
     if (g_HooksActive) {
-      // [NEW] sf_help logic
-      if (g_cvar_sf_help.value > 0.0f) {
-        if (g_pfnConPrintf) {
-          ((void (*)(const char *, ...))g_pfnConPrintf)("--- Commands ---\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  frame_skip <value>  - Skip frames (0=Off)\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  change_id <0/1>     - Toggle ID Changer\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  sf_help <0/1>       - Show Help Menu\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  sb <0/1>            - Toggle SayiBilen (1=Ready)\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  sb_range <N>        - Guess Range (Default: 100)\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  sb_delay <MS>       - Delay in ms (Default: 5)\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  esp_ct <0/1>        - Toggle CT ESP\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  esp_t <0/1>         - Toggle T ESP\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  esp_type <1/2/3>    - 1=Glow 2=Box 3=Both\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  esp_label <0/1>     - Toggle Name+Distance Labels\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  no_smoke <0/1>      - Toggle Smoke Removal\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  ch <0/1>            - Toggle Custom Crosshair\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  ch_color            - RGB color (e.g., \"0 255 0\")\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  ch_length           - Crosshair line length\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  ch_offset           - Crosshair center offset\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  ch_thickness        - Crosshair line thickness\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  ch_import <name>    - Import cstrike/name.txt profile\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  ch_export <name>    - Export cstrike/name.txt profile\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  speedometer <0/1>   - Toggle Speedometer\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  speedometer_color   - RGB color (e.g., \"0 255 255\")\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  hide_knife <0/1>    - Hide Knife Viewmodel\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  hide_entities <0/1> - Hide Non Solid Map Entities\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  showfps <0/1>       - Toggle Real FPS Counter\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  anti_drug <0/1>     - Block server drug effects (FOV > 90)\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  +strafe_boost       - Hold to auto-perfect air acceleration\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  +auto_bhop          - Hold to auto crouch-jump on landing\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  +sgs                - Hold to auto Ground-Strafe (sgs 1/2)\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  sgs <0/1/2>         - 0=Off 1=Legit 2=Rage (with boost)\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "  F11                 - Toggle Stealth (Freeze-Patch-Thaw)\n");
-          ((void (*)(const char *, ...))g_pfnConPrintf)(
-              "--------------------\n");
-        }
-        // Reset to avoid spam
-        g_cvar_sf_help.value = 0.0f;
-      }
-
       // Sync no_smoke cvar to global bool
       if (g_cvar_no_smoke.string) {
         g_NoSmoke = (atoi(g_cvar_no_smoke.string) > 0);
