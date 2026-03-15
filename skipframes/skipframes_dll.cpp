@@ -4,9 +4,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <string>
+#include <cstring>
 #include <tlhelp32.h>
-#include <vector>
 #include <windows.h>
 //
 //
@@ -51,6 +50,42 @@ void Log(const char *fmt, ...) {
 }
 #define LogDebug Log
 #endif
+
+// -------------------------------------------------------------
+// ESP UTILS
+// -------------------------------------------------------------
+#define ESP_ORIGIN_OFFSET 704
+
+inline void ReadOrigin(void *ent, int offset, float &x, float &y, float &z) {
+  if (!ent) return;
+  float *fp = (float *)((char *)ent + offset);
+  x = fp[0];
+  y = fp[1];
+  z = fp[2];
+}
+
+// Identify team based on model name strings (Pure C-style for small DLL size)
+inline int GetTeamFromModel(const char *model) {
+  if (!model) return 0;
+  char s[64];
+  strncpy(s, model, 63);
+  s[63] = 0;
+  for (int i = 0; s[i]; i++) {
+    if (s[i] >= 'A' && s[i] <= 'Z') s[i] += 32;
+  }
+
+  // CT Models
+  if (strstr(s, "urban") || strstr(s, "gsg9") || strstr(s, "sas") || 
+      strstr(s, "gign") || strstr(s, "ct_") || strstr(s, "spetsnaz"))
+    return 2;
+
+  // T Models
+  if (strstr(s, "terror") || strstr(s, "leet") || strstr(s, "arctic") || 
+      strstr(s, "guerilla") || strstr(s, "militia") || strstr(s, "te_"))
+    return 1;
+
+  return 0;
+}
 
 // -------------------------------------------------------------
 // CVARS
@@ -1477,6 +1512,49 @@ int __cdecl Hook_StudioDrawPlayer(int flags, void *pplayer) {
   if (playerIndex >= 1 && playerIndex <= 32)
     team = g_PlayerTeam[playerIndex];
 
+  // Fallback: Model-based detection if TeamInfo was missed
+  if (team == 0 && playerIndex != -1 && g_pfnGetPlayerInfo) {
+      hud_player_info_t info;
+      memset(&info, 0, sizeof(info));
+      g_pfnGetPlayerInfo(playerIndex, &info);
+      if (info.model) {
+          team = GetTeamFromModel(info.model);
+          if (team != 0) g_PlayerTeam[playerIndex] = team; // Cache it
+      }
+  }
+
+  // 1. SKIP DEAD Players (Fixes dead body ESP)
+  // sequence > 100 typically means dead/spectating in GoldSrc
+  int seq = *(int *)((char *)pplayer + 44);
+  if (seq > 100)
+    return g_Original_StudioDrawPlayer(flags, pplayer);
+
+  // 2. SKIP SELF Glow (Fixes projection issues at zero distance)
+  int localIdx = -1;
+  if (g_pfnGetLocalPlayer) {
+    void *local = g_pfnGetLocalPlayer();
+    if (local) localIdx = *(int*)local; // Corrected offset from +4 to +0
+  }
+  if (playerIndex != -1 && playerIndex == localIdx)
+    return g_Original_StudioDrawPlayer(flags, pplayer);
+
+  // 2. DISTANCE GUARD for Glow (Skip if closer than 100 units)
+  float lX=0, lY=0, lZ=0;
+  if (g_pfnGetLocalPlayer) {
+    void *local = g_pfnGetLocalPlayer();
+    if (local) {
+        ReadOrigin(local, ESP_ORIGIN_OFFSET, lX, lY, lZ);
+    }
+  }
+  if (pplayer) {
+      float *eOrig = (float *)((char *)pplayer + 16); // entity_state_t.origin is at offset 16
+      float dx = eOrig[0] - lX, dy = eOrig[1] - lY, dz = eOrig[2] - lZ;
+      float d = sqrtf(dx*dx + dy*dy + dz*dz);
+      if (d > 0.1f && d < 100.0f) {
+          return g_Original_StudioDrawPlayer(flags, pplayer);
+      }
+  }
+
   bool shouldGlow = false;
   if (team == 1 && drawT)
     shouldGlow = true;
@@ -1496,11 +1574,8 @@ int __cdecl Hook_StudioDrawPlayer(int flags, void *pplayer) {
     return g_Original_StudioDrawPlayer(flags, pplayer);
   }
 
-  // ===== SAVE ALL GL STATE =====
-  if (g_glPushAttrib)
-    g_glPushAttrib(MY_GL_ALL_ATTRIB_BITS);
-
   // ===== GLOW PASS: Solid color silhouette through walls =====
+  // Minimal state changes to avoid "blinking"
   g_glDisable(MY_GL_DEPTH_TEST);
   g_glDepthMask(0);
   g_glEnable(MY_GL_BLEND);
@@ -1514,9 +1589,12 @@ int __cdecl Hook_StudioDrawPlayer(int flags, void *pplayer) {
 
   g_Original_StudioDrawPlayer(flags, pplayer);
 
-  // ===== RESTORE ALL GL STATE =====
-  if (g_glPopAttrib)
-    g_glPopAttrib();
+  // ===== RESTORE MINIMAL STATE =====
+  g_glEnable(MY_GL_DEPTH_TEST);
+  g_glDepthMask(1);
+  g_glDisable(MY_GL_BLEND);
+  g_glEnable(MY_GL_TEXTURE_2D);
+  g_glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
 
   // Draw the player normally (with original GL state restored)
   int ret = g_Original_StudioDrawPlayer(flags, pplayer);
@@ -1730,20 +1808,6 @@ void InitGlowESP() {
   }
 }
 
-// ESP: Read 3 floats (origin) at a raw byte offset from entity pointer
-inline void ReadOrigin(void *ent, int offset, float &x, float &y, float &z) {
-  float *fp = (float *)((char *)ent + offset);
-  x = fp[0];
-  y = fp[1];
-  z = fp[2];
-}
-
-// ESP: curstate.origin offset in cl_entity_s
-// sizeof(entity_state_t) = 340 bytes (confirmed via diagnostic scan)
-// cl_entity_s: index(4) + player(4) + baseline(340) + prevstate(340) = 688
-// entity_state_t.origin is at offset 16 (entityType+number+msg_time+messagenum)
-// curstate.origin = 688 + 16 = 704 (0x2C0)
-#define ESP_ORIGIN_OFFSET 704
 
 // ESP: Draw outlined box
 void DrawBox(int x, int y, int w, int h, int r, int g, int b, int a,
@@ -1900,6 +1964,8 @@ int __cdecl Hook_HUD_Redraw(float time, int intermission) {
     if (espType == 0)
       espType = 3; // Default
 
+    // [OPTIMIZATION] Removed glPushAttrib from start of HUD loop to prevent driver overhead
+
     // BOX enabled if type is 2 or 3 (Bit 1 set)
     bool drawBox = (espType & 2);
 
@@ -1929,12 +1995,30 @@ int __cdecl Hook_HUD_Redraw(float time, int intermission) {
       for (int i = 1; i <= 32; i++) {
         // 1. Check Team
         int team = g_PlayerTeam[i];
+        
+        // Fallback: Model-based detection if TeamInfo was missed
+        if (team == 0 && g_pfnGetPlayerInfo) {
+            hud_player_info_t info;
+            memset(&info, 0, sizeof(info));
+            g_pfnGetPlayerInfo(i, &info);
+            if (info.model) {
+                team = GetTeamFromModel(info.model);
+                if (team != 0) g_PlayerTeam[i] = team; // Cache it
+            }
+        }
+
         if (team == 0)
           continue;
         if (team == 1 && !drawT)
           continue;
         if (team == 2 && !drawCT)
           continue;
+
+        // Skip Local Player in ESP Box
+        int localIdx = -1;
+        if (localEnt) localIdx = *(int*)localEnt; // Corrected offset from +4 to +0
+        if (i == localIdx)
+            continue;
 
         // 2. Anti-Ghost Check + Get Player Name (reused for labels)
         char playerName[32] = {0};
@@ -1961,6 +2045,11 @@ int __cdecl Hook_HUD_Redraw(float time, int intermission) {
         float ox, oy, oz;
         ReadOrigin(ent, ESP_ORIGIN_OFFSET, ox, oy, oz);
         if (ox == 0.0f && oy == 0.0f && oz == 0.0f)
+          continue;
+
+        // Check sequence - skip dead players (Sequence > 100)
+        int seq = *(int *)((char *)ent + ESP_ORIGIN_OFFSET + 28);
+        if (seq > 100)
           continue;
 
         // Skip stale entities (dead, out of PVS/render distance)
