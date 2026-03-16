@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$dllPath = ".\skipframes-v1.10.2.dll"
+$dllPath = ".\skipframes-v1.11.0.dll"
 $headerPath = ".\embedded_dll.h"
 
 if (-not (Test-Path $dllPath)) {
