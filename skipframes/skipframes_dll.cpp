@@ -12,6 +12,26 @@
 #define OFF_SCR_UPDATE 0x4C2A0
 
 DWORD g_HwBase = 0;
+#define IN_ATTACK (1 << 0)
+#define IN_JUMP (1 << 1)
+#define IN_DUCK (1 << 2)
+#define IN_FORWARD (1 << 3)
+#define IN_BACK (1 << 4)
+#define IN_USE (1 << 5)
+#define IN_CANCEL (1 << 6)
+#define IN_LEFT (1 << 7)
+#define IN_RIGHT (1 << 8)
+#define IN_MOVELEFT (1 << 9)
+#define IN_MOVERIGHT (1 << 10)
+#define IN_ATTACK2 (1 << 11)
+#define IN_RUN (1 << 12)
+#define IN_RELOAD (1 << 13)
+#define IN_ALT1 (1 << 14)
+#define IN_SCORE (1 << 15)
+
+#define FL_ONGROUND (1 << 0)
+#define FL_DUCKING (1 << 1)
+#define M_PI_F 3.14159265358979323846f
 DWORD g_SCR = 0;
 DWORD g_CreateInterface = 0;
 DWORD g_SteamInternal = 0;
@@ -98,11 +118,8 @@ BYTE g_Orig_SI[5];
 BYTE g_Orig_Vol[5];
 
 // LOGGING
-#ifdef NDEBUG
-#define Log(...) ((void)0)
-#define LogDebug(...) ((void)0)
-#else
 void Log(const char *fmt, ...) {
+#ifndef NDEBUG
   char buf[4096];
   va_list ap;
   va_start(ap, fmt);
@@ -110,9 +127,9 @@ void Log(const char *fmt, ...) {
   va_end(ap);
   buf[sizeof(buf) - 1] = 0;
   OutputDebugStringA(buf);
+#endif
 }
 #define LogDebug Log
-#endif
 
 // -------------------------------------------------------------
 // ESP UTILS
@@ -185,7 +202,8 @@ cvar_t g_cvar_anti_drug = {"anti_drug", "1", 0, 1.0f, nullptr};
 cvar_t g_cvar_strafe_helper = {"strafe_helper", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_sgs = {"sgs", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_cl_antiss = {"anti_ss", "1", 0, 1.0f, nullptr};
-cvar_t g_cvar_null_canceling_movement = {"null_canceling_movement", "0", 0, 0.0f, nullptr};
+cvar_t g_cvar_null_canceling_movement = {"null_canceling_movement", "1", 0, 0.0f, nullptr};
+cvar_t g_cvar_qs = {"quick_scope", "1", 0, 0.0f, nullptr};
 cvar_t *g_pCvar_SideSpeed = nullptr;
 cvar_t *g_pCvar_ForwardSpeed = nullptr;
 cvar_t *g_pCvar_BackSpeed = nullptr;
@@ -249,6 +267,8 @@ void Cmd_ShowHelp() {
     ((void (*)(const char *, ...))g_pfnConPrintf)(
         "  sgs <0/1/2>         - 0=Off 1=Legit 2=Rage (with boost)\n");
     ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  quick_scope <0/1>   - Auto scope-then-shoot with QQ switch\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
         "  anti_ss <0/1>       - Hide visuals during screenshots\n");
     ((void (*)(const char *, ...))g_pfnConPrintf)(
         "  null_canceling_movement <0/1> - Prevents standing still (Snap Tap)\n");
@@ -285,15 +305,6 @@ typedef void (__cdecl *HUD_CL_CreateMove_t)(float, void *, int);
 HUD_CL_CreateMove_t g_Original_CL_CreateMove = nullptr;
 DWORD g_CL_CreateMove_Addr = 0;
 BYTE g_Orig_CL_CreateMove[6] = {0};
-
-#define M_PI_F 3.14159265358979323846f
-#define IN_JUMP  (1 << 1)
-#define IN_DUCK  (1 << 2)
-#define IN_FORWARD (1 << 3)
-#define IN_BACK    (1 << 4)
-#define IN_MOVELEFT (1 << 9)
-#define IN_MOVERIGHT (1 << 10)
-#define FL_ONGROUND (1 << 9)
 
 // Player flags from playermove_s (for ground detection)
 int g_PlayerFlags = 0;
@@ -536,6 +547,8 @@ HUD_PlayerMove_t g_Original_HUD_PlayerMove = nullptr;
 DWORD g_HUD_PlayerMove_Addr = 0;
 BYTE g_Orig_HUD_PlayerMove[10];
 float g_TrueEngineVelocity[3] = {0.0f, 0.0f, 0.0f};
+int g_QuickScopeState = 0;
+int g_QS_WaitTicks = 0;
 
 // [NEW] Anti-Screenshot (Anti-SS) State
 DWORD g_AntiSS_EndTime = 0;
@@ -2079,22 +2092,49 @@ int __cdecl Hook_HUD_Redraw(float time, int intermission) {
   // 1. Unhook
   memcpy((void *)g_HUD_Redraw_Addr, g_Orig_HUD_Redraw, 6);
 
-  // 2. Call Original
+  // 2. Ensure GL functions are loaded (needed for state management)
+  static bool glLoaded = false;
+  if (!glLoaded) {
+    HMODULE hGL = GetModuleHandleA("opengl32.dll");
+    if (hGL) {
+      if (!g_glEnable)
+        g_glEnable = (glEnable_t)GetProcAddress(hGL, "glEnable");
+      if (!g_glDisable)
+        g_glDisable = (glDisable_t)GetProcAddress(hGL, "glDisable");
+      if (!g_glColor4f)
+        g_glColor4f = (glColor4f_t)GetProcAddress(hGL, "glColor4f");
+      if (!g_glPushAttrib)
+        g_glPushAttrib = (glPushAttrib_t)GetProcAddress(hGL, "glPushAttrib");
+      if (!g_glPopAttrib)
+        g_glPopAttrib = (glPopAttrib_t)GetProcAddress(hGL, "glPopAttrib");
+      glLoaded = true;
+    }
+  }
+
+  // 3. Restore GL state BEFORE original HUD draws
+  // StudioDrawPlayer (Glow ESP) may have left dirty state from the 3D scene
+  if (g_glEnable)
+    g_glEnable(MY_GL_TEXTURE_2D);
+  if (g_glDisable)
+    g_glDisable(MY_GL_BLEND);
+  if (g_glColor4f)
+    g_glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+
+  // 4. Call Original (Draw engine HUD / Sniper Overlays)
   int res = ((HUD_Redraw_t)g_HUD_Redraw_Addr)(time, intermission);
 
-  // 3. Rehook
+  // 5. Rehook
   BYTE patch[5] = {0xE9, 0, 0, 0, 0};
   *(DWORD *)(patch + 1) = (DWORD)Hook_HUD_Redraw - (DWORD)g_HUD_Redraw_Addr - 5;
   memcpy((void *)g_HUD_Redraw_Addr, patch, 5);
   *(BYTE *)((DWORD)g_HUD_Redraw_Addr + 5) = 0x90;
 
-  // 4. Check Anti-SS (Only run our visuals if screen is NOT being captured)
+  // 6. Check Anti-SS (Only run our visuals if screen is NOT being captured)
   if (ShouldHideVisuals()) {
       return res;
   }
-  // ------------------------------------
-  // Update HideWeapon dynamically if 'ch' is toggled
-  // ------------------------------------
+
+  // 7. Update HideWeapon dynamically if 'ch' is toggled
   static bool lastCrosshairState = false;
   bool currentCrosshairState = (g_cvar_ch.value != 0.0f);
   if (lastCrosshairState != currentCrosshairState) {
@@ -2108,11 +2148,9 @@ int __cdecl Hook_HUD_Redraw(float time, int intermission) {
     }
   }
 
-  // --- REAL FPS CALCULATION ---
+  // 8. Visual Calculations (FPS etc)
   DWORD curTime = GetTickCount();
-  if (g_LastFPSUpdateTime == 0) {
-    g_LastFPSUpdateTime = curTime;
-  }
+  if (g_LastFPSUpdateTime == 0) g_LastFPSUpdateTime = curTime;
   DWORD elapsed = curTime - g_LastFPSUpdateTime;
   if (elapsed >= 1000) {
     g_RealFPS = (float)g_FPSFrameCount * 1000.0f / (float)elapsed;
@@ -2120,394 +2158,159 @@ int __cdecl Hook_HUD_Redraw(float time, int intermission) {
     g_LastFPSUpdateTime = curTime;
   }
 
-  // --- REAL FPS DISPLAY (TOP LEFT) ---
-  if (g_cvar_showfps.value != 0.0f && g_pfnDrawConsoleString &&
-      g_pfnDrawSetTextColor) {
-    char fpsText[32];
-    sprintf(fpsText, "FPS: %d", (int)g_RealFPS);
-
-    // Default bright yellow/green for visibility
-    g_pfnDrawSetTextColor(0.5f, 1.0f, 0.0f);
-    g_pfnDrawConsoleString(10, 10, fpsText);
-  }
-
-  // Auto-rehook safety checks (Fixes Alt-Tab zero-speed bug caused by engine
-  // exceptions)
+  // 9. Rehook Safeties (Fast-Hook maintenance)
   if (g_HooksActive) {
     if (g_HUD_PlayerMove_Addr && *(BYTE *)g_HUD_PlayerMove_Addr != 0xE9) {
-      BYTE patch[5] = {0xE9, 0, 0, 0, 0};
-      *(DWORD *)(patch + 1) =
-          (DWORD)Hook_HUD_PlayerMove - (DWORD)g_HUD_PlayerMove_Addr - 5;
+      *(DWORD *)(patch + 1) = (DWORD)Hook_HUD_PlayerMove - (DWORD)g_HUD_PlayerMove_Addr - 5;
       memcpy((void *)g_HUD_PlayerMove_Addr, patch, 5);
       *(BYTE *)((DWORD)g_HUD_PlayerMove_Addr + 5) = 0x90;
     }
-    if (g_pfnConPrintf && *(BYTE *)g_pfnConPrintf != 0xE9) {
-      BYTE patch[5] = {0xE9, 0, 0, 0, 0};
-      *(DWORD *)(patch + 1) = (DWORD)Hook_ConPrintf - (DWORD)g_pfnConPrintf - 5;
-      memcpy((void *)g_pfnConPrintf, patch, 5);
-      *(BYTE *)((DWORD)g_pfnConPrintf + 5) = 0x90;
-    }
   }
 
-  // Ensure GL functions are loaded (needed for state management)
-  static bool glLoaded = false;
-  if (!glLoaded) {
-    HMODULE hGL = GetModuleHandleA("opengl32.dll");
-    if (hGL) {
-      if (!g_glEnable)
-        g_glEnable = (glEnable_t)GetProcAddress(hGL, "glEnable");
-      if (!g_glDisable)
-        g_glDisable = (glDisable_t)GetProcAddress(hGL, "glDisable");
-      if (!g_glColor4f)
-        g_glColor4f = (glColor4f_t)GetProcAddress(hGL, "glColor4f");
-      glLoaded = true;
-    }
-  }
-
-  // Restore GL state BEFORE original HUD draws
-  // Glow ESP (StudioDrawPlayer) may have left dirty state from 3D scene
-  if (g_glEnable)
-    g_glEnable(MY_GL_TEXTURE_2D);
-  if (g_glDisable)
-    g_glDisable(MY_GL_BLEND);
-  if (g_glColor4f)
-    g_glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-
-  // Also load glPushAttrib/glPopAttrib if not loaded yet
-  if (!g_glPushAttrib) {
-    HMODULE hGL2 = GetModuleHandleA("opengl32.dll");
-    if (hGL2) {
-      g_glPushAttrib = (glPushAttrib_t)GetProcAddress(hGL2, "glPushAttrib");
-      g_glPopAttrib = (glPopAttrib_t)GetProcAddress(hGL2, "glPopAttrib");
-    }
-  }
-
-  // Fast-Patch: Memory is kept unlocked. Swap bytes instantly.
-  int ret = 0;
-  if (g_HUD_Redraw_Addr) {
-    memcpy((void *)g_HUD_Redraw_Addr, g_Orig_HUD_Redraw, 6);
-
-    ret = g_pfnHUD_Redraw(time, intermission);
-
-    BYTE patch[5] = {0xE9, 0, 0, 0, 0};
-    *(DWORD *)(patch + 1) = (DWORD)Hook_HUD_Redraw - g_HUD_Redraw_Addr - 5;
-    memcpy((void *)g_HUD_Redraw_Addr, patch, 5);
-    if (6 > 5)
-      memset((void *)(g_HUD_Redraw_Addr + 5), 0x90, 1);
-  }
-
-  // ===== SAVE GL STATE before ESP drawing =====
+  // 10. Draw Cheat Visuals
   if (g_glPushAttrib)
     g_glPushAttrib(MY_GL_ALL_ATTRIB_BITS);
 
-  // ===== ESP DRAWING =====
   if (g_HooksActive) {
     bool drawCT = (g_cvar_ct_esp.value != 0.0f);
     bool drawT = (g_cvar_t_esp.value != 0.0f);
-
-    // Check esp_type (1=Glow, 2=Box, 3=Both)
     int espType = (int)g_cvar_esp_type.value;
-    if (espType == 0)
-      espType = 3; // Default
-
-    // [OPTIMIZATION] Removed glPushAttrib from start of HUD loop to prevent driver overhead
-
-    // BOX enabled if type is 2 or 3 (Bit 1 set)
+    if (espType == 0) espType = 3;
     bool drawBox = (espType & 2);
 
-    if (drawBox && (drawCT || drawT) && g_pfnFillRGBA &&
-        g_pfnTriWorldToScreen && g_pfnGetEntityByIndex) {
-
+    if (drawBox && (drawCT || drawT) && g_pfnFillRGBA && g_pfnTriWorldToScreen && g_pfnGetEntityByIndex) {
       int scrW = 800, scrH = 600;
       if (g_pfnGetScreenInfo) {
         static SCREENINFO scr;
         scr.iSize = sizeof(SCREENINFO);
         g_pfnGetScreenInfo(&scr);
-        if (scr.iWidth > 0)
-          scrW = scr.iWidth;
-        if (scr.iHeight > 0)
-          scrH = scr.iHeight;
+        if (scr.iWidth > 0) { scrW = scr.iWidth; scrH = scr.iHeight; }
       }
 
-      // Cache local player pointer (once for distance calc)
       void *localEnt = g_pfnGetLocalPlayer ? g_pfnGetLocalPlayer() : nullptr;
-      float localX = 0, localY = 0, localZ = 0;
-      if (localEnt)
-        ReadOrigin(localEnt, ESP_ORIGIN_OFFSET, localX, localY, localZ);
-
-      // Cache label setting
+      float lx=0, ly=0, lz=0;
+      if (localEnt) ReadOrigin(localEnt, ESP_ORIGIN_OFFSET, lx, ly, lz);
       bool showLabels = (g_cvar_esp_label.value != 0.0f);
 
       for (int i = 1; i <= 32; i++) {
-        // 1. Check Team
         int team = g_PlayerTeam[i];
-        
-        // Fallback: Model-based detection if TeamInfo was missed
         if (team == 0 && g_pfnGetPlayerInfo) {
-            hud_player_info_t info;
-            memset(&info, 0, sizeof(info));
+            hud_player_info_t info; memset(&info, 0, sizeof(info));
             g_pfnGetPlayerInfo(i, &info);
-            if (info.model) {
-                team = GetTeamFromModel(info.model);
-                if (team != 0) g_PlayerTeam[i] = team; // Cache it
-            }
+            if (info.model) { team = GetTeamFromModel(info.model); if (team != 0) g_PlayerTeam[i] = team; }
         }
+        if (team == 0) continue;
+        if (team == 1 && !drawT) continue;
+        if (team == 2 && !drawCT) continue;
 
-        if (team == 0)
-          continue;
-        if (team == 1 && !drawT)
-          continue;
-        if (team == 2 && !drawCT)
-          continue;
+        void *ent = g_pfnGetEntityByIndex(i);
+        if (!ent || ent == localEnt) continue;
 
-        // Skip Local Player in ESP Box
-        int localIdx = -1;
-        if (localEnt) localIdx = *(int*)localEnt; // Corrected offset from +4 to +0
-        if (i == localIdx)
-            continue;
+        int modelIdx = *(int *)((char *)ent + ESP_ORIGIN_OFFSET + 24);
+        if (modelIdx == 0) continue;
 
-        // 2. Anti-Ghost Check + Get Player Name (reused for labels)
         char playerName[32] = {0};
         if (g_pfnGetPlayerInfo) {
-          hud_player_info_t info;
-          memset(&info, 0, sizeof(info));
+          hud_player_info_t info; memset(&info, 0, sizeof(info));
           g_pfnGetPlayerInfo(i, &info);
-          if (!info.name || !info.name[0])
-            continue; // Invalid/ghost player
+          if (!info.name || !info.name[0]) continue;
           strncpy(playerName, info.name, 31);
-          playerName[31] = '\0';
         }
 
-        // 3. Get Entity Pointer (simple null check, no IsBadReadPtr)
-        void *ent = g_pfnGetEntityByIndex(i);
-        if (!ent)
-          continue;
+        int seq = *(int *)((char *)ent + ESP_ORIGIN_OFFSET + 28);
+        if (seq > 100) continue;
 
-        // Check curstate.modelindex - skip dormant
-        int modelIdx = *(int *)((char *)ent + ESP_ORIGIN_OFFSET + 24);
-        if (modelIdx == 0)
-          continue;
+        float entMsgTime = *(float *)((char *)ent + ESP_ORIGIN_OFFSET - 8);
+        if (entMsgTime > 0.0f && (time - entMsgTime) > 1.0f) continue;
 
         float ox, oy, oz;
         ReadOrigin(ent, ESP_ORIGIN_OFFSET, ox, oy, oz);
-        if (ox == 0.0f && oy == 0.0f && oz == 0.0f)
-          continue;
-
-        // Check sequence - skip dead players (Sequence > 100)
-        int seq = *(int *)((char *)ent + ESP_ORIGIN_OFFSET + 28);
-        if (seq > 100)
-          continue;
-
-        // Skip stale entities (dead, out of PVS/render distance)
-        // curstate.msg_time is at entity_state_t offset 8 = ESP_ORIGIN_OFFSET -
-        // 8
-        float entMsgTime = *(float *)((char *)ent + ESP_ORIGIN_OFFSET - 8);
-        if (entMsgTime > 0.0f && (time - entMsgTime) > 1.0f)
-          continue;
-
-        // GoldSrc origin is at player waist (center of hull)
-        float feetOrigin[3] = {ox, oy, oz - 36.0f};
-        float headOrigin[3] = {ox, oy, oz + 36.0f};
-        float feetX, feetY, headX, headY;
-
-        if (!W2S(feetOrigin, feetX, feetY, scrW, scrH))
-          continue;
-        if (!W2S(headOrigin, headX, headY, scrW, scrH))
-          continue;
-
-        float boxHeight = feetY - headY;
-        if (boxHeight < 4.0f)
-          continue;
-        if (boxHeight > scrH)
-          continue;
-        float boxWidth = boxHeight * 0.5f;
-
-        int bx = (int)(headX - boxWidth / 2.0f);
-        int by = (int)headY;
-        int bw = (int)boxWidth;
-        int bh = (int)boxHeight;
-
-        if (bx + bw < 0 || bx > scrW || by + bh < 0 || by > scrH)
-          continue;
-
-        // Color: Red for T, Blue for CT
-        int cr = 0, cg = 0, cb = 0;
-        if (team == 1) {
-          cr = 255;
-          cg = 50;
-          cb = 50;
-        }
-        if (team == 2) {
-          cr = 50;
-          cg = 100;
-          cb = 255;
-        }
-
-        DrawBox(bx, by, bw, bh, cr, cg, cb, 200, 2);
-
-        // Draw player name + distance (gated by esp_label)
-        if (showLabels && boxHeight > 20.0f && g_pfnDrawSetTextColor &&
-            g_pfnDrawConsoleString) {
-
-          // Truncate name when far (small box)
-          if (boxHeight < 100.0f && strlen(playerName) > 8)
-            playerName[8] = '\0';
-          else if (boxHeight < 150.0f && strlen(playerName) > 15)
-            playerName[15] = '\0';
-
-          // Calculate distance (using cached local player pos)
-          float dist = 0;
-          if (localEnt) {
-            float dx = ox - localX, dy = oy - localY, dz = oz - localZ;
-            dist = sqrt(dx * dx + dy * dy + dz * dz);
-          }
-
-          // Calculate scaling based on distance (using box height)
-          // Box Height 100+ -> Scale 1.0
-          // Box Height 20 -> Scale 0.5
-          float scale = 1.0f;
-          if (boxHeight < 100.0f) {
-            scale = 0.5f + (boxHeight / 200.0f); // 0.5 ... 1.0 range approx
-          }
-          if (scale < 0.5f)
-            scale = 0.5f;
-          if (scale > 1.0f)
-            scale = 1.0f;
-
-          g_pfnDrawSetTextColor((float)cr / 255.0f, (float)cg / 255.0f,
-                                (float)cb / 255.0f);
-          char label[96];
-          sprintf(label, "%s [%.0fm]", playerName, dist / 40.0f);
-
-          // Apply GL scaling
-          if (g_glMatrixMode && g_glPushMatrix && g_glPopMatrix && g_glScalef) {
-            int labelGap = (boxHeight > 60.0f) ? 14 : 10;
-            float drawX = (float)bx;
-            float drawY = (float)(by - labelGap);
-
-            // To scale text "in place", we must scale coordinate system
-            // If we scale by 0.5, coordinates must be doubled to stay same
-            // screen pos
-            g_glMatrixMode(MY_GL_PROJECTION);
-            g_glPushMatrix();
-            g_glScalef(scale, scale, 1.0f);
-
-            g_pfnDrawConsoleString((int)(drawX / scale), (int)(drawY / scale),
-                                   label);
-
-            g_glPopMatrix();
-          } else {
-            // Fallback no scaling
-            int labelGap = (boxHeight > 60.0f) ? 14 : 10;
-            g_pfnDrawConsoleString(bx, by - labelGap, label);
-          }
-        }
-      }
-    }
-
-    // --- SPEEDOMETER ---
-    if (g_cvar_speedometer.value != 0.0f) {
-      if (g_pfnGetLocalPlayer && g_pfnDrawSetTextColor &&
-          g_pfnDrawConsoleString) {
-        cl_entity_t *pLocal = (cl_entity_t *)g_pfnGetLocalPlayer();
-        if (pLocal && !IsBadReadPtr(pLocal, sizeof(cl_entity_t))) {
-          // Uses identical float readout from the POST-simulation physics hook!
-          float engineSpeed =
-              sqrtf((g_TrueEngineVelocity[0] * g_TrueEngineVelocity[0]) +
-                    (g_TrueEngineVelocity[1] * g_TrueEngineVelocity[1]));
-
-          static float displayedTextSpeed = 0.0f;
-          static float lastDisplayTime = 0.0f;
-
-          // Servers do NOT use EMA math. They just blast the raw instantaneous
-          // float onto the HUD every 0.1s. By updating instantly, we erase the
-          // 0.3s temporal trailing delay completely!
-          if (time - lastDisplayTime >= 0.1f || time < lastDisplayTime) {
-            displayedTextSpeed = engineSpeed;
-            if (displayedTextSpeed < 1.0f)
-              displayedTextSpeed = 0.0f;
-            lastDisplayTime = time;
-          }
-
-          // Only draw if we actually have a valid reading
-          if (displayedTextSpeed >= 0.0f && displayedTextSpeed < 4000.0f) {
-            char speedText[32];
-            sprintf(speedText, "Speed: %.2f", displayedTextSpeed);
-
-            // Fetch custom RGB color from CVar
-            int cr = 0, cg = 255, cb = 255; // Default: Cyan
-            if (g_cvar_speedometer_color.string) {
-              sscanf(g_cvar_speedometer_color.string, "%d %d %d", &cr, &cg,
-                     &cb);
-            }
-            g_pfnDrawSetTextColor((float)cr / 255.0f, (float)cg / 255.0f,
-                                  (float)cb / 255.0f);
-
-            int drawX = 400;
-            int drawY = 500;
-            if (g_pfnGetScreenInfo) {
-              SCREENINFO scr = {0};
-              scr.iSize = sizeof(SCREENINFO);
-              g_pfnGetScreenInfo(&scr);
-              if (scr.iWidth > 0 && scr.iHeight > 0) {
-                drawX = scr.iWidth / 2 - 40;
-                drawY = scr.iHeight - 100;
-              }
-            }
-            g_pfnDrawConsoleString(drawX, drawY, speedText);
-          }
-        }
-      }
-    }
-
-
-    // --- CUSTOM CROSSHAIR ---
-    bool isScoped = (g_CurrentFOV < 90 && g_CurrentFOV > 0);
-    if (g_cvar_ch.value != 0.0f && !isScoped) {
-      if (g_pfnGetScreenInfo && g_pfnFillRGBA) {
         
-        SCREENINFO scr = {0};
-        scr.iSize = sizeof(SCREENINFO);
-        g_pfnGetScreenInfo(&scr);
-        if (scr.iWidth > 0 && scr.iHeight > 0) {
-          int cx = scr.iWidth / 2;
-          int cy = scr.iHeight / 2;
-          
-          int r = 0, g = 255, b = 0, a = 255;
-          if (g_cvar_ch_color.string) {
-            sscanf(g_cvar_ch_color.string, "%d %d %d", &r, &g, &b);
-          }
-          
-          int length = 5;
-          if (g_cvar_ch_length.string) length = atoi(g_cvar_ch_length.string);
-          if (length < 1) length = 1;
-          
-          int offset = 5;
-          if (g_cvar_ch_offset.string) offset = atoi(g_cvar_ch_offset.string);
-          if (offset < 0) offset = 0;
-          
-          int thick = 2;
-          if (g_cvar_ch_thickness.string) thick = atoi(g_cvar_ch_thickness.string);
-          if (thick < 1) thick = 1;
+        float feetOrigin[3] = {ox, oy, oz - 36.0f};
+        float headOrigin[3] = {ox, oy, oz + 36.0f}; 
+        float fx, fy, hx, hy;
+        if (W2S(feetOrigin, fx, fy, scrW, scrH) && W2S(headOrigin, hx, hy, scrW, scrH)) {
+           float bh = fy - hy;
+           if (bh > 4.0f && bh < scrH) {
+             float bw = bh * 0.5f;
+             int bx = (int)(hx - bw / 2.0f);
+             int cr = (team == 1 ? 255 : 50), cg = (team == 1 ? 50 : 100), cb = (team == 1 ? 50 : 255);
+             DrawBox(bx, (int)hy, (int)bw, (int)bh, cr, cg, cb, 200, 2);
 
-          // Top
-          g_pfnFillRGBA(cx - (thick / 2), cy - offset - length, thick, length, r, g, b, a);
-          // Bottom
-          g_pfnFillRGBA(cx - (thick / 2), cy + offset, thick, length, r, g, b, a);
-          // Left
-          g_pfnFillRGBA(cx - offset - length, cy - (thick / 2), length, thick, r, g, b, a);
-          // Right
-          g_pfnFillRGBA(cx + offset, cy - (thick / 2), length, thick, r, g, b, a);
+             if (showLabels && bh > 20.0f && g_pfnDrawConsoleString) {
+                float dist = 0;
+                if (localEnt) { float dx = ox - lx, dy = oy - ly, dz = oz - lz; dist = sqrt(dx*dx + dy*dy + dz*dz); }
+                char label[96]; sprintf(label, "%s [%.0fm]", playerName, dist / 40.0f);
+                g_pfnDrawSetTextColor((float)cr/255.0f, (float)cg/255.0f, (float)cb/255.0f);
+                
+                if (g_glMatrixMode && g_glPushMatrix) {
+                   float scale = (bh < 100.0f) ? (0.5f + (bh / 200.0f)) : 1.0f;
+                   if (scale < 0.5f) scale = 0.5f;
+                   g_glMatrixMode(MY_GL_PROJECTION); g_glPushMatrix(); g_glScalef(scale, scale, 1.0f);
+                   g_pfnDrawConsoleString((int)((float)bx/scale), (int)((hy-12.0f)/scale), label);
+                   g_glPopMatrix();
+                } else {
+                   g_pfnDrawConsoleString(bx, (int)(hy - 12), label);
+                }
+             }
+           }
         }
       }
+    }
+
+    // Speedometer
+    if (g_cvar_speedometer.value != 0.0f && g_pfnGetLocalPlayer && g_pfnDrawConsoleString) {
+        float engineSpeed = sqrtf((g_TrueEngineVelocity[0] * g_TrueEngineVelocity[0]) + (g_TrueEngineVelocity[1] * g_TrueEngineVelocity[1]));
+        static float dispSpeed = 0.0f;
+        static float lastUpd = 0.0f;
+        if (time - lastUpd >= 0.1f) { dispSpeed = engineSpeed; lastUpd = time; }
+        
+        if (dispSpeed >= 0.0f && dispSpeed < 4000.0f) {
+           char speedText[32]; sprintf(speedText, "Speed: %.2f", dispSpeed);
+           int cr = 0, cg = 255, cb = 255;
+           if (g_cvar_speedometer_color.string) sscanf(g_cvar_speedometer_color.string, "%d %d %d", &cr, &cg, &cb);
+           g_pfnDrawSetTextColor((float)cr/255.0f, (float)cg/255.0f, (float)cb/255.0f);
+           
+           int dx = 400, dy = 500;
+           if (g_pfnGetScreenInfo) {
+              static SCREENINFO sinfo; sinfo.iSize = sizeof(SCREENINFO); g_pfnGetScreenInfo(&sinfo);
+              if (sinfo.iWidth > 0) { dx = sinfo.iWidth/2 - 40; dy = sinfo.iHeight - 100; }
+           }
+           g_pfnDrawConsoleString(dx, dy, speedText);
+        }
+    }
+
+    // FPS
+    if (g_cvar_showfps.value != 0.0f && g_pfnDrawConsoleString) {
+        char fpsText[32]; sprintf(fpsText, "FPS: %d", (int)g_RealFPS);
+        g_pfnDrawSetTextColor(0.5f, 1.0f, 0.0f); g_pfnDrawConsoleString(10, 10, fpsText);
+    }
+
+    // Crosshair
+    bool isScoped = (g_CurrentFOV < 90 && g_CurrentFOV > 0);
+    if (g_cvar_ch.value != 0.0f && !isScoped && g_pfnFillRGBA) {
+       SCREENINFO scr; scr.iSize = sizeof(SCREENINFO); g_pfnGetScreenInfo(&scr);
+       if (scr.iWidth > 0) {
+         int cx = scr.iWidth/2, cy = scr.iHeight/2;
+         int r=0, g=255, b=0, a=255;
+         if (g_cvar_ch_color.string) sscanf(g_cvar_ch_color.string, "%d %d %d", &r, &g, &b);
+         int len=5, off=5, thk=2;
+         if (g_cvar_ch_length.string) len = atoi(g_cvar_ch_length.string);
+         if (g_cvar_ch_offset.string) off = atoi(g_cvar_ch_offset.string);
+         if (g_cvar_ch_thickness.string) thk = atoi(g_cvar_ch_thickness.string);
+         
+         g_pfnFillRGBA(cx-(thk/2), cy-off-len, thk, len, r, g, b, a); // Top
+         g_pfnFillRGBA(cx-(thk/2), cy+off, thk, len, r, g, b, a);     // Bottom
+         g_pfnFillRGBA(cx-off-len, cy-(thk/2), len, thk, r, g, b, a); // Left
+         g_pfnFillRGBA(cx+off, cy-(thk/2), len, thk, r, g, b, a);     // Right
+       }
     }
   }
 
-  // ===== RESTORE ALL GL STATE after ESP drawing =====
   if (g_glPopAttrib)
     g_glPopAttrib();
 
-  return ret;
+  return res;
 }
 
 DWORD FindEngineDraw() {
@@ -2830,6 +2633,74 @@ void __cdecl Hook_CL_CreateMove(float frametime, void *cmd, int active) {
       if (g_cvar_sgs.value >= 2.0f) {
         ApplyStrafeHelper(cmd);
       }
+    }
+
+    // --- Quick Scope (AWP/Scout) with QQ ---
+    if (g_cvar_qs.value != 0.0f) {
+        // AWP = 18, Scout = 3 or 21/22? User confirmed 18 for AWP, and mentioned 22.
+        bool isSniper = (g_CurrentWeaponID == 18 || g_CurrentWeaponID == 3 || g_CurrentWeaponID == 22 || g_CurrentWeaponID == 13);
+        if (isSniper) {
+            bool isScoped = (g_CurrentFOV < 90 && g_CurrentFOV > 0);
+            
+            if (g_QuickScopeState == 1) {
+                // State 1: Wait for scope to open
+                *pButtons &= ~IN_ATTACK;
+                static int s_scopeTimeout = 0;
+                if (isScoped) {
+                    g_QS_WaitTicks = 3; 
+                    g_QuickScopeState = 2;
+                    s_scopeTimeout = 0;
+                } else if (++s_scopeTimeout > 30) {
+                    g_QuickScopeState = 0;
+                    s_scopeTimeout = 0;
+                }
+            }
+            else if (g_QuickScopeState == 2) {
+                // State 2: Accuracy delay
+                *pButtons &= ~IN_ATTACK;
+                if (g_QS_WaitTicks > 0) {
+                    g_QS_WaitTicks--;
+                } else {
+                    g_QuickScopeState = 3;
+                }
+            }
+            else if (g_QuickScopeState == 3) {
+                // State 3: Fire!
+                *pButtons |= IN_ATTACK;
+                g_QS_WaitTicks = 10; // Wait 10 frames for server registration
+                g_QuickScopeState = 4;
+            }
+            else if (g_QuickScopeState == 4) {
+                // State 4: Fire persistence (ensure server sees shot/ammo depletion)
+                *pButtons |= IN_ATTACK;
+                if (g_QS_WaitTicks > 0) {
+                    g_QS_WaitTicks--;
+                } else {
+                    g_QuickScopeState = 5;
+                }
+            }
+            else if (g_QuickScopeState == 5) {
+                // State 5: Switch back to sniper
+                if (g_pfnClientCmd) {
+                    g_pfnClientCmd("slot3"); // Switch to knife
+                    g_pfnClientCmd("lastinv"); // Switch back to sniper
+                }
+                g_QuickScopeState = 0;
+            }
+            else if ((*pButtons) & IN_ATTACK) {
+                if (!isScoped) {
+                    // Start Quick Scope sequence (Zoom -> Fire -> QQ)
+                    *pButtons &= ~IN_ATTACK;
+                    *pButtons |= IN_ATTACK2;
+                    g_QuickScopeState = 1;
+                } else {
+                    // Manual fire while scoped -> Trigger QQ sequence
+                    g_QuickScopeState = 3;
+                }
+            }
+        } else {
+            g_QuickScopeState = 0;
+        }
     }
   }
 
@@ -3439,6 +3310,7 @@ DWORD WINAPI MainThread(LPVOID) {
      g_RegisterCvar(&g_cvar_sgs);
      g_RegisterCvar(&g_cvar_cl_antiss);
      g_RegisterCvar(&g_cvar_null_canceling_movement);
+     g_RegisterCvar(&g_cvar_qs);
    }
  
    // Register +strafe_boost / -strafe_boost commands
