@@ -204,6 +204,7 @@ cvar_t g_cvar_sgs = {"sgs", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_cl_antiss = {"anti_ss", "1", 0, 1.0f, nullptr};
 cvar_t g_cvar_null_canceling_movement = {"null_canceling_movement", "1", 0, 0.0f, nullptr};
 cvar_t g_cvar_qs = {"quick_scope", "1", 0, 0.0f, nullptr};
+cvar_t g_cvar_no_scope = {"no_scope", "1", 0, 0.0f, nullptr};
 cvar_t *g_pCvar_SideSpeed = nullptr;
 cvar_t *g_pCvar_ForwardSpeed = nullptr;
 cvar_t *g_pCvar_BackSpeed = nullptr;
@@ -278,6 +279,8 @@ void Cmd_ShowHelp() {
         "  +strafe_helper      - Hold to auto-strafe/detect keys\n");
     ((void (*)(const char *, ...))g_pfnConPrintf)(
         "  strafe_helper <0/1/2> - 0=Off 1=Legit 2=Rage\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  no_scope <0/1>      - Force crosshair for snipers while unscoped\n");
     ((void (*)(const char *, ...))g_pfnConPrintf)(
         "--------------------\n");
   }
@@ -2292,7 +2295,10 @@ int __cdecl Hook_HUD_Redraw(float time, int intermission) {
 
     // Crosshair
     bool isScoped = (g_CurrentFOV < 90 && g_CurrentFOV > 0);
-    if (g_cvar_ch.value != 0.0f && !isScoped && g_pfnFillRGBA) {
+    bool isSniper = (g_CurrentWeaponID == 18 || g_CurrentWeaponID == 3);
+    bool forceCH = (g_cvar_no_scope.value != 0.0f && isSniper);
+
+    if ((g_cvar_ch.value != 0.0f || forceCH) && !isScoped && g_pfnFillRGBA) {
        SCREENINFO scr; scr.iSize = sizeof(SCREENINFO); g_pfnGetScreenInfo(&scr);
        if (scr.iWidth > 0) {
          int cx = scr.iWidth/2, cy = scr.iHeight/2;
@@ -3314,6 +3320,7 @@ DWORD WINAPI MainThread(LPVOID) {
      g_RegisterCvar(&g_cvar_cl_antiss);
      g_RegisterCvar(&g_cvar_null_canceling_movement);
      g_RegisterCvar(&g_cvar_qs);
+     g_RegisterCvar(&g_cvar_no_scope);
    }
  
    // Register +strafe_boost / -strafe_boost commands
