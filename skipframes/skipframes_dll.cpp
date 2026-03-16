@@ -2682,8 +2682,7 @@ void __cdecl Hook_CL_CreateMove(float frametime, void *cmd, int active) {
             else if (g_QuickScopeState == 5) {
                 // State 5: Switch back to sniper
                 if (g_pfnClientCmd) {
-                    g_pfnClientCmd("slot3"); // Switch to knife
-                    g_pfnClientCmd("lastinv"); // Switch back to sniper
+                    g_pfnClientCmd("lastinv; lastinv"); // QQ switch without menu interference
                 }
                 g_QuickScopeState = 0;
             }
