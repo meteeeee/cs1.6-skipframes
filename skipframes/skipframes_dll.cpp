@@ -2638,7 +2638,7 @@ void __cdecl Hook_CL_CreateMove(float frametime, void *cmd, int active) {
     // --- Quick Scope (AWP/Scout) with QQ ---
     if (g_cvar_qs.value != 0.0f) {
         // AWP = 18, Scout = 3 or 21/22? User confirmed 18 for AWP, and mentioned 22.
-        bool isSniper = (g_CurrentWeaponID == 18 || g_CurrentWeaponID == 3 || g_CurrentWeaponID == 22 || g_CurrentWeaponID == 13);
+        bool isSniper = (g_CurrentWeaponID == 18 || g_CurrentWeaponID == 3);
         if (isSniper) {
             bool isScoped = (g_CurrentFOV < 90 && g_CurrentFOV > 0);
             
