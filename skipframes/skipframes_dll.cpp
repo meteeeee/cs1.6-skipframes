@@ -275,6 +275,10 @@ void Cmd_ShowHelp() {
     ((void (*)(const char *, ...))g_pfnConPrintf)(
         "  F11                 - Toggle Stealth (Freeze-Patch-Thaw)\n");
     ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  +strafe_helper      - Hold to auto-strafe/detect keys\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  strafe_helper <0/1/2> - 0=Off 1=Legit 2=Rage\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
         "--------------------\n");
   }
 }
