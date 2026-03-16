@@ -29,7 +29,7 @@ DWORD g_HwBase = 0;
 #define IN_ALT1 (1 << 14)
 #define IN_SCORE (1 << 15)
 
-#define FL_ONGROUND (1 << 0)
+#define FL_ONGROUND (1 << 9)
 #define FL_DUCKING (1 << 1)
 #define M_PI_F 3.14159265358979323846f
 DWORD g_SCR = 0;
@@ -1003,7 +1003,7 @@ void __cdecl Hook_SPR_Set(int hPic, int r, int g, int b) {
   }
   
   if (g_cvar_ch.value != 0.0f) {
-    if (hPic == g_CrosshairsSpriteID || hPic == g_CrosshairSpriteID || hPic == g_SniperScopeSpriteID) {
+    if (hPic > 0 && (hPic == g_CrosshairsSpriteID || hPic == g_CrosshairSpriteID || hPic == g_SniperScopeSpriteID)) {
       g_BlockCurrentSprite = true;
     }
   }
@@ -1015,7 +1015,7 @@ void __cdecl Hook_SPR_Set(int hPic, int r, int g, int b) {
 
 // No-Smoke: Hook SPR_Draw (Engine Index 5) - TABLE HOOK
 void __cdecl Hook_SPR_Draw(int frame, int x, int y, const void *prc) {
-  if (!g_BlockCurrentSprite || !g_NoSmoke) {
+  if (!g_BlockCurrentSprite) {
     if (g_Original_SPR_Draw)
       g_Original_SPR_Draw(frame, x, y, prc);
   }
@@ -1023,7 +1023,7 @@ void __cdecl Hook_SPR_Draw(int frame, int x, int y, const void *prc) {
 
 // No-Smoke: Hook SPR_DrawHoles (Engine Index 6) - TABLE HOOK
 void __cdecl Hook_SPR_DrawHoles(int frame, int x, int y, const void *prc) {
-  if (!g_BlockCurrentSprite || !g_NoSmoke) {
+  if (!g_BlockCurrentSprite) {
     if (g_Original_SPR_DrawHoles)
       g_Original_SPR_DrawHoles(frame, x, y, prc);
   }
@@ -1031,7 +1031,7 @@ void __cdecl Hook_SPR_DrawHoles(int frame, int x, int y, const void *prc) {
 
 // No-Smoke: Hook SPR_DrawAdditive (Engine Index 7) - TABLE HOOK
 void __cdecl Hook_SPR_DrawAdditive(int frame, int x, int y, const void *prc) {
-  if (!g_BlockCurrentSprite || !g_NoSmoke) {
+  if (!g_BlockCurrentSprite) {
     if (g_Original_SPR_DrawAdditive)
       g_Original_SPR_DrawAdditive(frame, x, y, prc);
   }
