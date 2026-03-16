@@ -554,6 +554,8 @@ HUD_PlayerMove_t g_Original_HUD_PlayerMove = nullptr;
 DWORD g_HUD_PlayerMove_Addr = 0;
 BYTE g_Orig_HUD_PlayerMove[10];
 float g_TrueEngineVelocity[3] = {0.0f, 0.0f, 0.0f};
+DWORD g_LastVelocityUpdateTime = 0;
+
 int g_QuickScopeState = 0;
 int g_QS_WaitTicks = 0;
 
@@ -680,6 +682,8 @@ void Hook_HUD_PlayerMove(void *ppmove, int server) {
     g_TrueEngineVelocity[0] = *(float *)((char *)ppmove + 92);
     g_TrueEngineVelocity[1] = *(float *)((char *)ppmove + 96);
     g_TrueEngineVelocity[2] = *(float *)((char *)ppmove + 100);
+    g_LastVelocityUpdateTime = GetTickCount();
+
     g_PlayerFlags = *(int *)((char *)ppmove + 184); // flags (FL_ONGROUND etc.)
   }
 
@@ -2268,9 +2272,14 @@ int __cdecl Hook_HUD_Redraw(float time, int intermission) {
     // Speedometer
     if (g_cvar_speedometer.value != 0.0f && g_pfnGetLocalPlayer && g_pfnDrawConsoleString) {
         float engineSpeed = sqrtf((g_TrueEngineVelocity[0] * g_TrueEngineVelocity[0]) + (g_TrueEngineVelocity[1] * g_TrueEngineVelocity[1]));
+        
+        // Fix: If hasn't updated in 0.5s (Alt-Tabbed), zero it out so it doesn't stay stuck on old speed
+        if (GetTickCount() - g_LastVelocityUpdateTime > 500) engineSpeed = 0.0f;
+
         static float dispSpeed = 0.0f;
         static float lastUpd = 0.0f;
-        if (time - lastUpd >= 0.1f) { dispSpeed = engineSpeed; lastUpd = time; }
+        // Fix: Use 0.1s update freq but handle engine time resets/wraps properly
+        if (time < lastUpd || time - lastUpd >= 0.1f) { dispSpeed = engineSpeed; lastUpd = time; }
         
         if (dispSpeed >= 0.0f && dispSpeed < 4000.0f) {
            char speedText[32]; sprintf(speedText, "Speed: %.2f", dispSpeed);
