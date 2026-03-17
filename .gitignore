@@ -5,5 +5,13 @@
 !skipframes/
 !skipframes/**
 
+# Exclude build artifacts and temp files inside skipframes
+skipframes/**/*.dll
+skipframes/**/*.exe
+skipframes/**/*.o
+skipframes/**/__pycache__/
+skipframes/**/*.pyc
+skipframes/**/build_log*.txt
+
 # Whitelist .gitignore itself
 !.gitignore

@@ -7,7 +7,12 @@ echo ==========================================
 
 :: 1. Compile DLL
 echo [1/3] Compiling DLL...
-g++ skipframes_dll.cpp sayi_bilen.cpp -o skipframes-v1.11.2.dll -shared -static -m32 -O3 -DNDEBUG -fno-exceptions -fno-rtti -fmerge-all-constants -lpsapi -luser32 -lkernel32 -static-libgcc -static-libstdc++ -s
+g++ skipframes_dll.cpp sayi_bilen.cpp ^
+    -o skipframes-v1.11.2.dll ^
+    -shared -static -m32 -O3 -DNDEBUG ^
+    -fno-exceptions -fno-rtti -fmerge-all-constants ^
+    -lpsapi -luser32 -lkernel32 ^
+    -static-libgcc -static-libstdc++ -s
 if %errorlevel% neq 0 (
     echo [ERROR] DLL Compilation Failed!
     pause
@@ -26,7 +31,12 @@ if not exist embedded_dll.h (
 :: 3. Compile Injector (EXE)
 echo [3/3] Compiling Injector...
 if exist skipframes-v1.11.2.exe del skipframes-v1.11.2.exe
-g++ skipframes.cpp -o skipframes-v1.11.2.exe -static -m32 -O3 -DNDEBUG -fno-exceptions -fno-rtti -fmerge-all-constants -luser32 -lkernel32 -static-libgcc -static-libstdc++ -s
+g++ skipframes.cpp ^
+    -o skipframes-v1.11.2.exe ^
+    -static -m32 -O3 -DNDEBUG ^
+    -fno-exceptions -fno-rtti -fmerge-all-constants ^
+    -luser32 -lkernel32 ^
+    -static-libgcc -static-libstdc++ -s
 if %errorlevel% neq 0 (
     echo [ERROR] EXE Compilation Failed!
     pause
