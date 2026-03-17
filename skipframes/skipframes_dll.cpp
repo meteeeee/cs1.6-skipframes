@@ -2495,19 +2495,37 @@ static void ApplyStrafeHelper(void *cmd) {
 // Mode 2: Hybrid (Legit + Rage Boost)
 // -------------------------------------------------------------
 static void ApplyStrafeHelperLegit(void *cmd, float deltaYaw, int mode) {
-  if (!cmd) return;
-  float *pSideMove = (float *)((char *)cmd + 20);
+    if (!cmd) return;
 
-  if (fabsf(deltaYaw) < 0.1f) return;
-  float mouseDir = (deltaYaw < 0.0f) ? 1.0f : -1.0f;
+    unsigned short *pButtons = (unsigned short *)((char *)cmd + 30);
+    float *pSideMove = (float *)((char *)cmd + 20);
 
-  if (mode == 1 || mode == 2) {
-    *pSideMove = mouseDir * 400.0f; // LEGIT: Sync keys to mouse
-  }
+    if (mode == 1) {
+        // LEGIT: precise button + sidemove sync
+        if (fabsf(deltaYaw) < 0.1f) return;
 
-  if (mode == 2) {
-    ApplyStrafeHelper(cmd); // HYBRID: Add rage boost on top
-  }
+        if (deltaYaw < 0.0f) {
+            *pButtons &= ~IN_MOVELEFT;
+            *pButtons |= IN_MOVERIGHT;
+            *pSideMove = 400.0f;
+        } else {
+            *pButtons &= ~IN_MOVERIGHT;
+            *pButtons |= IN_MOVELEFT;
+            *pSideMove = -400.0f;
+        }
+    }
+    else if (mode == 2) {
+        // RAGE: smoothed yaw + optimal strafe boost on top
+        if (fabsf(deltaYaw) < 0.1f) return;
+
+        static float s_smoothedYaw = 0.0f;
+        s_smoothedYaw = s_smoothedYaw * 0.6f + deltaYaw * 0.4f;
+
+        float mouseDir = (s_smoothedYaw < 0.0f) ? 1.0f : -1.0f;
+        *pSideMove = mouseDir * 400.0f;
+
+        ApplyStrafeHelper(cmd);
+    }
 }
 
 // -------------------------------------------------------------
