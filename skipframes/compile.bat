@@ -8,7 +8,7 @@ echo ==========================================
 :: 1. Compile DLL
 echo [1/3] Compiling DLL...
 g++ skipframes_dll.cpp sayi_bilen.cpp ^
-    -o skipframes-v1.11.3.dll ^
+    -o skipframes-v1.12.0.dll ^
     -shared -static -m32 -O3 -DNDEBUG ^
     -fno-exceptions -fno-rtti -fmerge-all-constants ^
     -lpsapi -luser32 -lkernel32 ^
@@ -30,9 +30,9 @@ if not exist embedded_dll.h (
 
 :: 3. Compile Injector (EXE)
 echo [3/3] Compiling Injector...
-if exist skipframes-v1.11.3.exe del skipframes-v1.11.3.exe
+if exist skipframes-v1.12.0.exe del skipframes-v1.12.0.exe
 g++ skipframes.cpp ^
-    -o skipframes-v1.11.3.exe ^
+    -o skipframes-v1.12.0.exe ^
     -static -m32 -O3 -DNDEBUG ^
     -fno-exceptions -fno-rtti -fmerge-all-constants ^
     -luser32 -lkernel32 ^
@@ -45,7 +45,7 @@ if %errorlevel% neq 0 (
 
 echo.
 echo ==========================================
-echo      BUILD SUCCESS: skipframes-v1.11.3.exe
+echo      BUILD SUCCESS: skipframes-v1.12.0.exe
 echo ==========================================
 echo.
 pause

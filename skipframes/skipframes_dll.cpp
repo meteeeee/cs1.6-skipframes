@@ -425,6 +425,7 @@ cvar_t *g_pCvar_drawviewmodel = nullptr; // Cached pointer - scanned once
 int __cdecl MsgFunc_SayText(const char *pszName, int iSize, void *pbuf);
 int __cdecl MsgFunc_ScreenFade(const char *pszName, int iSize, void *pbuf);
 InitiateGameConnection_t g_Original_Initiate = nullptr;
+DWORD *g_pSteamUserVTable = nullptr;
 // -------------------------------------------------------------
 // ENGINE TABLE
 // -------------------------------------------------------------
@@ -648,11 +649,11 @@ int __cdecl Hook_HUD_AddEntity(int type, void *ent, const char *modelname) {
   // Unhook -> call original -> rehook (memory kept permanently unlocked)
   memcpy((void *)g_HUD_AddEntity_Addr, g_Orig_HUD_AddEntity, 6);
   int result = ((HUD_AddEntity_t)g_HUD_AddEntity_Addr)(type, ent, modelname);
-  BYTE patch[5] = {0xE9, 0, 0, 0, 0};
-  *(DWORD *)(patch + 1) =
-      (DWORD)Hook_HUD_AddEntity - (DWORD)g_HUD_AddEntity_Addr - 5;
-  memcpy((void *)g_HUD_AddEntity_Addr, patch, 5);
-  *(BYTE *)((DWORD)g_HUD_AddEntity_Addr + 5) = 0x90;
+    BYTE patch[5] = {0xE9, 0, 0, 0, 0};
+    *(DWORD *)(patch + 1) =
+        (DWORD)Hook_HUD_AddEntity - (DWORD)g_HUD_AddEntity_Addr - 5;
+    memcpy((void *)g_HUD_AddEntity_Addr, patch, 5);
+    *(BYTE *)((DWORD)g_HUD_AddEntity_Addr + 5) = 0x90;
 
   return result;
 }
@@ -688,11 +689,11 @@ void Hook_HUD_PlayerMove(void *ppmove, int server) {
   }
 
   // Hook back IN
-  BYTE patch[5] = {0xE9, 0, 0, 0, 0};
-  *(DWORD *)(patch + 1) =
-      (DWORD)Hook_HUD_PlayerMove - (DWORD)g_HUD_PlayerMove_Addr - 5;
-  memcpy((void *)g_HUD_PlayerMove_Addr, patch, 5);
-  *(BYTE *)((DWORD)g_HUD_PlayerMove_Addr + 5) = 0x90;
+    BYTE patch[5] = {0xE9, 0, 0, 0, 0};
+    *(DWORD *)(patch + 1) =
+        (DWORD)Hook_HUD_PlayerMove - (DWORD)g_HUD_PlayerMove_Addr - 5;
+    memcpy((void *)g_HUD_PlayerMove_Addr, patch, 5);
+    *(BYTE *)((DWORD)g_HUD_PlayerMove_Addr + 5) = 0x90;
 }
 
 void Hook_ConPrintf(const char *fmt, void *a1, void *a2, void *a3) {
@@ -708,10 +709,10 @@ void Hook_ConPrintf(const char *fmt, void *a1, void *a2, void *a3) {
   ((void (*)(const char *, ...))g_pfnConPrintf)(fmt, a1, a2, a3, 0, 0, 0, 0, 0);
 
   // 4. Rehook
-  BYTE patch[5] = {0xE9, 0, 0, 0, 0};
-  *(DWORD *)(patch + 1) = (DWORD)Hook_ConPrintf - (DWORD)g_pfnConPrintf - 5;
-  memcpy((void *)g_pfnConPrintf, patch, 5);
-  *(BYTE *)((DWORD)g_pfnConPrintf + 5) = 0x90;
+    BYTE patch[5] = {0xE9, 0, 0, 0, 0};
+    *(DWORD *)(patch + 1) = (DWORD)Hook_ConPrintf - (DWORD)g_pfnConPrintf - 5;
+    memcpy((void *)g_pfnConPrintf, patch, 5);
+    *(BYTE *)((DWORD)g_pfnConPrintf + 5) = 0x90;
 }
 
 // -------------------------------------------------------------
@@ -1557,6 +1558,7 @@ void ApplyVTableHooks(void *iface, const char *pName) {
     DWORD vptr = obj[0];
     if (!IsBadReadPtr((void *)vptr, 4)) {
       DWORD *vtable = (DWORD *)vptr;
+      g_pSteamUserVTable = vtable;
       DWORD oldV;
       if (VirtualProtect(vtable, 256, PAGE_EXECUTE_READWRITE, &oldV)) {
         if (vtable[3] != (DWORD)Hook_LegacyAuth) {
@@ -1585,11 +1587,11 @@ void *__cdecl Hook_CreateInterface(const char *pName, int *pReturnCode) {
   CreateInterface_t fn = (CreateInterface_t)g_CreateInterface;
   void *iface = fn(pName, pReturnCode);
 
-  VirtualProtect((void *)g_CreateInterface, 5, PAGE_EXECUTE_READWRITE, &old);
-  BYTE patch[5] = {0xE9, 0, 0, 0, 0};
-  *(DWORD *)(patch + 1) = (DWORD)Hook_CreateInterface - g_CreateInterface - 5;
-  memcpy((void *)g_CreateInterface, patch, 5);
-  VirtualProtect((void *)g_CreateInterface, 5, old, &old);
+    VirtualProtect((void *)g_CreateInterface, 5, PAGE_EXECUTE_READWRITE, &old);
+    BYTE patch[5] = {0xE9, 0, 0, 0, 0};
+    *(DWORD *)(patch + 1) = (DWORD)Hook_CreateInterface - g_CreateInterface - 5;
+    memcpy((void *)g_CreateInterface, patch, 5);
+    VirtualProtect((void *)g_CreateInterface, 5, old, &old);
 
   if (iface && pName)
     ApplyVTableHooks(iface, pName);
@@ -1605,11 +1607,11 @@ void *__cdecl Hook_SteamInternal(const char *pName, int *pReturnCode) {
   CreateInterface_t fn = (CreateInterface_t)g_SteamInternal;
   void *iface = fn(pName, pReturnCode);
 
-  VirtualProtect((void *)g_SteamInternal, 5, PAGE_EXECUTE_READWRITE, &old);
-  BYTE patch[5] = {0xE9, 0, 0, 0, 0};
-  *(DWORD *)(patch + 1) = (DWORD)Hook_SteamInternal - g_SteamInternal - 5;
-  memcpy((void *)g_SteamInternal, patch, 5);
-  VirtualProtect((void *)g_SteamInternal, 5, old, &old);
+    VirtualProtect((void *)g_SteamInternal, 5, PAGE_EXECUTE_READWRITE, &old);
+    BYTE patch[5] = {0xE9, 0, 0, 0, 0};
+    *(DWORD *)(patch + 1) = (DWORD)Hook_SteamInternal - g_SteamInternal - 5;
+    memcpy((void *)g_SteamInternal, patch, 5);
+    VirtualProtect((void *)g_SteamInternal, 5, old, &old);
 
   if (iface && pName)
     ApplyVTableHooks(iface, pName);
@@ -2135,10 +2137,10 @@ int __cdecl Hook_HUD_Redraw(float time, int intermission) {
   int res = ((HUD_Redraw_t)g_HUD_Redraw_Addr)(time, intermission);
 
   // 5. Rehook
-  BYTE patch[5] = {0xE9, 0, 0, 0, 0};
-  *(DWORD *)(patch + 1) = (DWORD)Hook_HUD_Redraw - (DWORD)g_HUD_Redraw_Addr - 5;
-  memcpy((void *)g_HUD_Redraw_Addr, patch, 5);
-  *(BYTE *)((DWORD)g_HUD_Redraw_Addr + 5) = 0x90;
+    BYTE patch[5] = {0xE9, 0, 0, 0, 0};
+    *(DWORD *)(patch + 1) = (DWORD)Hook_HUD_Redraw - (DWORD)g_HUD_Redraw_Addr - 5;
+    memcpy((void *)g_HUD_Redraw_Addr, patch, 5);
+    *(BYTE *)((DWORD)g_HUD_Redraw_Addr + 5) = 0x90;
 
   // 6. Check Anti-SS (Only run our visuals if screen is NOT being captured)
   if (ShouldHideVisuals()) {
@@ -2172,9 +2174,10 @@ int __cdecl Hook_HUD_Redraw(float time, int intermission) {
   // 9. Rehook Safeties (Fast-Hook maintenance)
   if (g_HooksActive) {
     if (g_HUD_PlayerMove_Addr && *(BYTE *)g_HUD_PlayerMove_Addr != 0xE9) {
-      *(DWORD *)(patch + 1) = (DWORD)Hook_HUD_PlayerMove - (DWORD)g_HUD_PlayerMove_Addr - 5;
-      memcpy((void *)g_HUD_PlayerMove_Addr, patch, 5);
-      *(BYTE *)((DWORD)g_HUD_PlayerMove_Addr + 5) = 0x90;
+    BYTE patch2[5] = {0xE9, 0, 0, 0, 0};
+    *(DWORD *)(patch2 + 1) = (DWORD)Hook_HUD_PlayerMove - (DWORD)g_HUD_PlayerMove_Addr - 5;
+    memcpy((void *)g_HUD_PlayerMove_Addr, patch2, 5);
+    *(BYTE *)((DWORD)g_HUD_PlayerMove_Addr + 5) = 0x90;
     }
   }
 
@@ -2741,12 +2744,12 @@ void __cdecl Hook_CL_CreateMove(float frametime, void *cmd, int active) {
   }
 
   // Re-hook
-  VirtualProtect((void *)g_CL_CreateMove_Addr, 10, PAGE_EXECUTE_READWRITE, &old);
-  BYTE patch[5] = {0xE9, 0, 0, 0, 0};
-  *(DWORD *)(patch + 1) = (DWORD)Hook_CL_CreateMove - g_CL_CreateMove_Addr - 5;
-  memcpy((void *)g_CL_CreateMove_Addr, patch, 5);
-  *(BYTE *)(g_CL_CreateMove_Addr + 5) = 0x90;
-  VirtualProtect((void *)g_CL_CreateMove_Addr, 10, old, &old);
+    VirtualProtect((void *)g_CL_CreateMove_Addr, 10, PAGE_EXECUTE_READWRITE, &old);
+    BYTE patch[5] = {0xE9, 0, 0, 0, 0};
+    *(DWORD *)(patch + 1) = (DWORD)Hook_CL_CreateMove - g_CL_CreateMove_Addr - 5;
+    memcpy((void *)g_CL_CreateMove_Addr, patch, 5);
+    *(BYTE *)(g_CL_CreateMove_Addr + 5) = 0x90;
+    VirtualProtect((void *)g_CL_CreateMove_Addr, 10, old, &old);
 }
 
 void InstallHooks() {
@@ -3178,6 +3181,34 @@ void RemoveHooks() {
     LogDebug("[NoSmoke] Smoke function restored\n");
   }
 
+  if (g_pfnCbuf_AddText && g_Orig_Cbuf[0] != 0) {
+    memcpy((void *)g_pfnCbuf_AddText, g_Orig_Cbuf, 6);
+  }
+
+  // Restore Steam VTable
+  if (g_pSteamUserVTable && g_Original_Initiate) {
+    DWORD oldV;
+    if (VirtualProtect(g_pSteamUserVTable, 256, PAGE_EXECUTE_READWRITE, &oldV)) {
+      g_pSteamUserVTable[3] = (DWORD)g_Original_Initiate;
+      VirtualProtect(g_pSteamUserVTable, 256, oldV, &oldV);
+      LogDebug("[Hooks] Steam VTable restored\n");
+    }
+  }
+
+  // Restore SPR_Load (Index 0 in Engine Table)
+  if (g_EngineTable && g_pfnSPR_Load_Original) {
+    DWORD old;
+    if (VirtualProtect(g_EngineTable, 100 * 4, PAGE_READWRITE, &old)) {
+      g_EngineTable[0] = (void *)g_pfnSPR_Load_Original;
+      VirtualProtect(g_EngineTable, 100 * 4, old, &old);
+    }
+  }
+
+  // Reset states
+  g_QuickScopeState = 0;
+  g_QS_WaitTicks = 0;
+  g_AntiSS_EndTime = 0;
+  g_AntiSS_PendingSnapshot = 0;
 
   g_HooksActive = false;
 }
