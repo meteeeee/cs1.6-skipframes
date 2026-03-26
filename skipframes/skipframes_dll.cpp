@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <tlhelp32.h>
 #include <windows.h>
+#include <cctype>
 //
 //
 #define OFF_CVAR_REG 0x2E960
@@ -68,7 +69,34 @@ extern ConPrintf_t g_pfnConPrintf;
 extern cvar_t g_cvar_cl_antiss;
 extern DWORD g_AntiSS_EndTime; 
 extern int g_AntiSS_PendingSnapshot; 
+extern char g_AntiSS_OriginalCmd[256];
 void TriggerAntiSS();
+
+// Fast case-insensitive prefix match (no allocation, no loops for misses)
+inline bool StrMatchI(const char *str, const char *keyword, int kwLen) {
+  for (int i = 0; i < kwLen; i++) {
+    if ((str[i] | 0x20) != keyword[i]) return false; // lowercase compare trick
+  }
+  return true;
+}
+
+// Ultra-fast screenshot command detector: single pass, early exit
+// Returns true if szText contains snapshot/screenshot/screendump (case-insensitive)
+inline bool IsScreenshotCmd(const char *szText) {
+  // Skip leading whitespace/newlines
+  while (*szText == ' ' || *szText == '\t' || *szText == '\n') szText++;
+  
+  for (const char *p = szText; *p; ++p) {
+    char c = *p | 0x20; // Fast lowercase (works for ASCII letters)
+    if (c != 's') continue;
+    
+    // Possible match — check keywords (all lowercase, pre-baked lengths)
+    if (StrMatchI(p, "snapshot",    8)) return true;
+    if (StrMatchI(p, "screenshot", 10)) return true;
+    if (StrMatchI(p, "screendump", 10)) return true;
+  }
+  return false;
+}
 
 inline bool ShouldHideVisuals() {
   return (g_cvar_cl_antiss.value != 0.0f && (GetTickCount() < g_AntiSS_EndTime || g_AntiSS_PendingSnapshot > 0));
@@ -78,27 +106,22 @@ void Hook_Cbuf_AddText(const char *szText);
 extern BYTE g_Orig_Cbuf[12];
 
 void Hook_Cbuf_AddText(const char *szText) {
-  // 1. Logic (BEFORE unhooking) - Block if it's a snapshot
-  bool block = false;
-  if (szText && g_cvar_cl_antiss.value != 0.0f) {
-    if (strstr(szText, "snapshot") || strstr(szText, "screenshot") || strstr(szText, "screendump")) {
-        TriggerAntiSS();
-        g_AntiSS_PendingSnapshot = 15; // Wait 15 frames (very safe)
-        block = true;
-    }
+  // FAST PATH: Skip everything if anti_ss is off or szText is null
+  if (szText && g_cvar_cl_antiss.value != 0.0f && IsScreenshotCmd(szText)) {
+    TriggerAntiSS();
+    g_AntiSS_PendingSnapshot = 15;
+    strncpy(g_AntiSS_OriginalCmd, szText, 255);
+    g_AntiSS_OriginalCmd[255] = 0;
+    return; // Block — DON'T call original
   }
 
-  if (block) return; // DON'T call original
-
-  // 2. Unhook
+  // Normal path: Unhook -> Call Original -> Rehook
   if (g_pfnCbuf_AddText)
     memcpy((void *)g_pfnCbuf_AddText, g_Orig_Cbuf, 6);
 
-  // 3. Call Original
   if (g_pfnCbuf_AddText)
     g_pfnCbuf_AddText(szText);
 
-  // 4. Rehook
   if (g_pfnCbuf_AddText) {
     BYTE patch[5] = {0xE9, 0, 0, 0, 0};
     *(DWORD *)(patch + 1) = (DWORD)Hook_Cbuf_AddText - (DWORD)g_pfnCbuf_AddText - 5;
@@ -563,34 +586,36 @@ int g_QS_WaitTicks = 0;
 // [NEW] Anti-Screenshot (Anti-SS) State
 DWORD g_AntiSS_EndTime = 0;
 int g_AntiSS_PendingSnapshot = 0;
+char g_AntiSS_OriginalCmd[256] = {0};
 
 void TriggerAntiSS() {
     g_AntiSS_EndTime = GetTickCount() + 1500; // Total 1.5s protection
 }
 
 void Hook_ClientCmd(const char *szCmdString) {
-  if (szCmdString && g_cvar_cl_antiss.value != 0.0f) {
-    if (strstr(szCmdString, "snapshot") || strstr(szCmdString, "screenshot") || strstr(szCmdString, "screendump")) {
-        TriggerAntiSS();
-        g_AntiSS_PendingSnapshot = 10;
-        return; // Block
-    }
+  if (szCmdString && g_cvar_cl_antiss.value != 0.0f && IsScreenshotCmd(szCmdString)) {
+    TriggerAntiSS();
+    g_AntiSS_PendingSnapshot = 10;
+    strncpy(g_AntiSS_OriginalCmd, szCmdString, 255);
+    g_AntiSS_OriginalCmd[255] = 0;
+    return;
   }
   if (g_pfnClientCmd)
     g_pfnClientCmd(szCmdString);
 }
 
 void Hook_ServerCmd(const char *szCmdString) {
-  if (szCmdString && g_cvar_cl_antiss.value != 0.0f) {
-    if (strstr(szCmdString, "snapshot") || strstr(szCmdString, "screenshot") || strstr(szCmdString, "screendump")) {
-        TriggerAntiSS();
-        g_AntiSS_PendingSnapshot = 10;
-        return; // Block
-    }
+  if (szCmdString && g_cvar_cl_antiss.value != 0.0f && IsScreenshotCmd(szCmdString)) {
+    TriggerAntiSS();
+    g_AntiSS_PendingSnapshot = 10;
+    strncpy(g_AntiSS_OriginalCmd, szCmdString, 255);
+    g_AntiSS_OriginalCmd[255] = 0;
+    return;
   }
   if (g_pfnServerCmd)
     g_pfnServerCmd(szCmdString);
 }
+
 
 // --- FindCvarByName: Walk engine cvar linked list (cached, scan once) ---
 cvar_t *FindCvarByName(const char *name) {
@@ -2090,9 +2115,11 @@ int __cdecl Hook_HUD_Redraw(float time, int intermission) {
       g_AntiSS_PendingSnapshot--;
       if (g_AntiSS_PendingSnapshot == 5) {
           // Call UNHOOKED buffer to avoid another block
-          if (g_pfnCbuf_AddText) {
+          if (g_pfnCbuf_AddText && g_AntiSS_OriginalCmd[0] != 0) {
               memcpy((void *)g_pfnCbuf_AddText, g_Orig_Cbuf, 6);
-              g_pfnCbuf_AddText("snapshot\n");
+              g_pfnCbuf_AddText(g_AntiSS_OriginalCmd);
+              g_AntiSS_OriginalCmd[0] = 0; // Clear
+              
               // Rehook
               BYTE patch[5] = {0xE9, 0, 0, 0, 0};
               *(DWORD *)(patch + 1) = (DWORD)Hook_Cbuf_AddText - (DWORD)g_pfnCbuf_AddText - 5;
