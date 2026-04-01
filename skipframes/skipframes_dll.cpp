@@ -204,6 +204,8 @@ cvar_t g_cvar_no_smoke = {"no_smoke", "1", 0, 1.0f, nullptr};
 cvar_t g_cvar_speedometer = {"speedometer", "1", 0, 1.0f, nullptr};
 cvar_t g_cvar_ct_esp = {"esp_ct", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_t_esp = {"esp_t", "0", 0, 0.0f, nullptr};
+cvar_t g_cvar_esp_enemy = {"esp_enemy", "0", 0, 0.0f, nullptr};
+cvar_t g_cvar_hide_teammates = {"hide_teammates", "0", 0, 0.0f, nullptr};
 cvar_t g_cvar_esp_type = {"esp_type", "3", 0, 0.0f,
                           nullptr}; // 1=Glow, 2=Box, 3=Both
 cvar_t g_cvar_esp_label = {"esp_label", "0", 0, 0.0f, nullptr}; // 1=show labels
@@ -228,6 +230,8 @@ cvar_t g_cvar_cl_antiss = {"anti_ss", "1", 0, 1.0f, nullptr};
 cvar_t g_cvar_null_canceling_movement = {"null_canceling_movement", "1", 0, 0.0f, nullptr};
 cvar_t g_cvar_qs = {"quick_scope", "1", 0, 0.0f, nullptr};
 cvar_t g_cvar_no_scope = {"no_scope", "1", 0, 0.0f, nullptr};
+cvar_t g_cvar_rnick_prefix = {"rnick_prefix", "", 0, 0.0f, nullptr};
+cvar_t g_cvar_rnick_suffix = {"rnick_suffix", "", 0, 0.0f, nullptr};
 cvar_t *g_pCvar_SideSpeed = nullptr;
 cvar_t *g_pCvar_ForwardSpeed = nullptr;
 cvar_t *g_pCvar_BackSpeed = nullptr;
@@ -250,6 +254,10 @@ void Cmd_ShowHelp() {
         "  esp_ct <0/1>        - Toggle CT ESP\n");
     ((void (*)(const char *, ...))g_pfnConPrintf)(
         "  esp_t <0/1>         - Toggle T ESP\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  esp_enemy <0/1>     - Auto-draw opposite team\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  hide_teammates <0/1> - Hide teammates via cl_min_t/ct\n");
     ((void (*)(const char *, ...))g_pfnConPrintf)(
         "  esp_type <1/2/3>    - 1=Glow 2=Box 3=Both\n");
     ((void (*)(const char *, ...))g_pfnConPrintf)(
@@ -305,8 +313,65 @@ void Cmd_ShowHelp() {
     ((void (*)(const char *, ...))g_pfnConPrintf)(
         "  no_scope <0/1>      - Force crosshair for snipers while unscoped\n");
     ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  rnick               - Generate a random nickname\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  rnick_prefix <str>  - Prefix for random nickname\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  rnick_suffix <str>  - Suffix for random nickname\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  steal_nick          - Steal a random player's name (minus last char)\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
         "--------------------\n");
   }
+}
+
+// Helper: Set in-game name safely (centralized to save space)
+void SetInGameName(const char* name) {
+    if (!name || !name[0] || !g_pfnCbuf_AddText) return;
+    char cmd[256];
+    // Minimal string building
+    strcpy(cmd, "name \"");
+    strncat(cmd, name, 240);
+    strcat(cmd, "\"\n");
+    g_pfnCbuf_AddText(cmd);
+}
+
+// Optimized procedural name generator (zero string arrays)
+void GenerateLeanName(char* out, int maxLen) {
+    const char c[] = "bcdfghjklmnprstvwz"; // 18 chars
+    const char v[] = "aeiou";             // 5 chars
+    int len = (rand() % 3) + 4;            // 4-6 chars
+    for (int i = 0; i < len; i++) {
+        out[i] = (i % 2 == 0) ? c[rand() % 18] : v[rand() % 5];
+    }
+    out[0] -= 32; // Capitalize
+    out[len] = '\0';
+}
+
+void Cmd_RandomNick() {
+    char name[128] = {0};
+    char word[32];
+    GenerateLeanName(word, 32);
+
+    // Apply prefix
+    if (g_cvar_rnick_prefix.string && g_cvar_rnick_prefix.string[0]) {
+        strncpy(name, g_cvar_rnick_prefix.string, 60);
+        strcat(name, " ");
+    }
+    
+    strcat(name, word);
+
+    // Apply suffix
+    if (g_cvar_rnick_suffix.string && g_cvar_rnick_suffix.string[0]) {
+        strcat(name, " ");
+        strncat(name, g_cvar_rnick_suffix.string, 30);
+    }
+
+    SetInGameName(name);
+
+    if (g_pfnConPrintf) {
+        ((void (*)(const char *, ...))g_pfnConPrintf)("[SkipFrames] New Nick: %s\n", name);
+    }
 }
 
 // [NEW] +strafe_boost Engine Command
@@ -510,6 +575,62 @@ struct hud_player_info_t {
 };
 typedef void (*GetPlayerInfo_t)(int ent_num, hud_player_info_t *pinfo);
 GetPlayerInfo_t g_pfnGetPlayerInfo = nullptr;
+
+// --- steal_nick command ---
+void Cmd_StealNick() {
+    if (!g_pfnGetLocalPlayer || !g_pfnGetPlayerInfo) return;
+
+    // 1. Safe pointer check for local player
+    void* pLocal = g_pfnGetLocalPlayer();
+    if (!pLocal || IsBadReadPtr(pLocal, sizeof(int))) {
+        if (g_pfnConPrintf) ((void (*)(const char *, ...))g_pfnConPrintf)("Can't use this command, you need to connect to server first.\n");
+        return;
+    }
+
+    int localIdx = *(int*)pLocal;
+
+    // 2. Scan for at least one valid player to confirm connection
+    int validPlayers[33];
+    int validCount = 0;
+    for (int i = 1; i <= 32; i++) {
+        hud_player_info_t info;
+        memset(&info, 0, sizeof(info));
+        g_pfnGetPlayerInfo(i, &info);
+        if (info.name && info.name[0]) {
+            if (i != localIdx) {
+                validPlayers[validCount++] = i;
+            }
+        }
+    }
+
+    // 3. If no other players found, maybe we are alone or disconnected
+    if (validCount == 0) {
+        if (g_pfnConPrintf) ((void (*)(const char *, ...))g_pfnConPrintf)("Can't use this command, you need to connect to server first.\n");
+        return;
+    }
+
+    int targetIdx = validPlayers[rand() % validCount];
+    hud_player_info_t targetInfo;
+    memset(&targetInfo, 0, sizeof(targetInfo));
+    g_pfnGetPlayerInfo(targetIdx, &targetInfo);
+
+    if (targetInfo.name) {
+        char newName[128];
+        strncpy(newName, targetInfo.name, 127);
+        newName[127] = 0;
+
+        int len = strlen(newName);
+        while (len > 0 && isspace((unsigned char)newName[len-1])) newName[--len] = 0;
+        if (len > 0) newName[len - 1] = 0;
+
+        if (newName[0]) {
+            SetInGameName(newName);
+            if (g_pfnConPrintf) {
+                ((void (*)(const char *, ...))g_pfnConPrintf)("[SF] Stolen: %s\n", newName);
+            }
+        }
+    }
+}
 
 // Minimal entity state for reading velocity
 struct entity_state_t {
@@ -1749,6 +1870,52 @@ bool g_GlowESP_Ready = false;
 int g_CurrentDrawingPlayerIndex = -1;
 
 // Glow ESP hook: intercepts player model rendering
+// --- ESP Enemy Helper ---
+void UpdateESPDrawSettings(bool& drawCT, bool& drawT) {
+    if (g_pfnGetLocalPlayer) {
+        void *local = g_pfnGetLocalPlayer();
+        if (local) {
+            int localIdx = *(int*)local;
+            if (localIdx >= 1 && localIdx <= 32) {
+                int localTeam = g_PlayerTeam[localIdx];
+                
+                // ESP Enemy Logic
+                if (g_cvar_esp_enemy.value != 0.0f) {
+                    if (localTeam == 1) { drawCT = true; drawT = false; }
+                    else if (localTeam == 2) { drawCT = false; drawT = true; }
+                }
+
+                // Hide Teammate Logic (Rate-limited to prevent spamming Cbuf_AddText)
+                static DWORD lastHideTeammateUpdate = 0;
+                static bool wasHideTeammateActive = false;
+                DWORD now = GetTickCount();
+                
+                bool isHideTeammateActive = (g_cvar_hide_teammates.value != 0.0f);
+                if (isHideTeammateActive && (now - lastHideTeammateUpdate > 1000 || !wasHideTeammateActive)) {
+                    if (g_pfnCbuf_AddText) {
+                        if (localTeam == 1) { // We are T -> Hide T
+                            g_pfnCbuf_AddText("cl_min_t 11\n");
+                            g_pfnCbuf_AddText("cl_min_ct 2\n");
+                        } else if (localTeam == 2) { // We are CT -> Hide CT
+                            g_pfnCbuf_AddText("cl_min_ct 10\n");
+                            g_pfnCbuf_AddText("cl_min_t 8\n");
+                        }
+                    }
+                    lastHideTeammateUpdate = now;
+                    wasHideTeammateActive = true;
+                } else if (!isHideTeammateActive && wasHideTeammateActive) {
+                    // Restore to visible when disabled
+                    if (g_pfnCbuf_AddText) {
+                        g_pfnCbuf_AddText("cl_min_t 8\n");
+                        g_pfnCbuf_AddText("cl_min_ct 2\n");
+                    }
+                    wasHideTeammateActive = false;
+                }
+            }
+        }
+    }
+}
+
 int __cdecl Hook_StudioDrawPlayer(int flags, void *pplayer) {
   if (!g_Original_StudioDrawPlayer)
     return 0;
@@ -1771,6 +1938,7 @@ int __cdecl Hook_StudioDrawPlayer(int flags, void *pplayer) {
   // Check if glow ESP is active for this player's team
   bool drawCT = (g_cvar_ct_esp.value != 0.0f);
   bool drawT = (g_cvar_t_esp.value != 0.0f);
+  UpdateESPDrawSettings(drawCT, drawT);
 
   int team = 0;
   if (playerIndex >= 1 && playerIndex <= 32)
@@ -2215,6 +2383,7 @@ int __cdecl Hook_HUD_Redraw(float time, int intermission) {
   if (g_HooksActive) {
     bool drawCT = (g_cvar_ct_esp.value != 0.0f);
     bool drawT = (g_cvar_t_esp.value != 0.0f);
+    UpdateESPDrawSettings(drawCT, drawT);
     int espType = (int)g_cvar_esp_type.value;
     if (espType == 0) espType = 3;
     bool drawBox = (espType & 2);
@@ -3406,11 +3575,16 @@ DWORD WINAPI MainThread(LPVOID) {
      g_RegisterCvar(&g_cvar_null_canceling_movement);
      g_RegisterCvar(&g_cvar_qs);
      g_RegisterCvar(&g_cvar_no_scope);
+     g_RegisterCvar(&g_cvar_rnick_prefix);
+     g_RegisterCvar(&g_cvar_rnick_suffix);
+     g_RegisterCvar(&g_cvar_esp_enemy);
+     g_RegisterCvar(&g_cvar_hide_teammates);
    }
  
    // Register +strafe_boost / -strafe_boost commands
    if (g_pfnAddCommand) {
      g_pfnAddCommand((char *)"sf_help", Cmd_ShowHelp);
+     g_pfnAddCommand((char *)"rnick", Cmd_RandomNick);
      g_pfnAddCommand((char *)"+strafe_boost", Cmd_StrafeBoost_On);
     g_pfnAddCommand((char *)"-strafe_boost", Cmd_StrafeBoost_Off);
     g_pfnAddCommand((char *)"+auto_bhop", Cmd_AutoBhop_On);
@@ -3419,7 +3593,8 @@ DWORD WINAPI MainThread(LPVOID) {
     g_pfnAddCommand((char *)"-sgs", Cmd_SGS_Off);
     g_pfnAddCommand((char *)"+strafe_helper", Cmd_StrafeHelper_On);
     g_pfnAddCommand((char *)"-strafe_helper", Cmd_StrafeHelper_Off);
-    LogDebug("[Commands] +strafe_boost, +auto_bhop, +sgs, and -sgs registered!\n");
+    g_pfnAddCommand((char *)"steal_nick", Cmd_StealNick);
+    LogDebug("[Commands] +strafe_boost, +auto_bhop, +sgs, steal_nick registered!\n");
   }
 
   InstallHooks();
