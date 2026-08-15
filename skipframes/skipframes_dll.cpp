@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <tlhelp32.h>
 #include <windows.h>
+#include <wininet.h>
 #include <cctype>
 //
 //
@@ -232,9 +233,64 @@ cvar_t g_cvar_qs = {"quick_scope", "1", 0, 0.0f, nullptr};
 cvar_t g_cvar_no_scope = {"no_scope", "1", 0, 0.0f, nullptr};
 cvar_t g_cvar_rnick_prefix = {"rnick_prefix", "", 0, 0.0f, nullptr};
 cvar_t g_cvar_rnick_suffix = {"rnick_suffix", "", 0, 0.0f, nullptr};
+cvar_t g_cvar_friend_esp = {"friend_esp", "1", 0, 1.0f, nullptr};
 cvar_t *g_pCvar_SideSpeed = nullptr;
 cvar_t *g_pCvar_ForwardSpeed = nullptr;
 cvar_t *g_pCvar_BackSpeed = nullptr;
+
+// -------------------------------------------------------------
+// FRIEND SYSTEM GLOBALS & STRUCTS
+// -------------------------------------------------------------
+typedef int (*Cmd_Argc_t)();
+typedef char *(*Cmd_Argv_t)(int i);
+Cmd_Argc_t g_pfnCmd_Argc = nullptr;
+Cmd_Argv_t g_pfnCmd_Argv = nullptr;
+
+struct hud_player_info_t {
+  char *name;
+  short ping;
+  unsigned char thisplayer;
+  unsigned char spectator;
+  unsigned char packetloss;
+  char *model;
+  short topcolor;
+  short bottomcolor;
+  uint64_t m_nSteamID;
+};
+typedef void (*GetPlayerInfo_t)(int ent_num, hud_player_info_t *pinfo);
+extern GetPlayerInfo_t g_pfnGetPlayerInfo;
+typedef void *(*GetLocalPlayer_t)();
+extern GetLocalPlayer_t g_pfnGetLocalPlayer;
+
+#define MAX_FRIENDS 32
+struct FriendEntry {
+  char nick[64];
+  bool active;
+};
+FriendEntry g_Friends[MAX_FRIENDS] = {0};
+
+// -------------------------------------------------------------
+// SKIPFRAMES PEER-SYNC GLOBALS
+// -------------------------------------------------------------
+#define MAX_SF_PEERS 64
+struct SFPeerEntry {
+  char nick[64];
+  char server[64];
+};
+SFPeerEntry g_GlobalSFUsers[MAX_SF_PEERS] = {0};
+int g_GlobalSFCount = 0;
+char g_SameServerSFUsers[32][64] = {0};
+int g_SameServerSFCount = 0;
+char g_CurrentServerIP[64] = "in_menu";
+char g_ClientSessionID[32] = {0};
+CRITICAL_SECTION g_PeerSyncCS;
+
+void AddFriend(const char *nick);
+void RemoveFriend(const char *nick);
+bool IsPlayerFriend(int playerIndex);
+bool IsPlayerSFUser(int playerIndex);
+void Cmd_SFList_Func();
+
 void Cmd_ShowHelp() {
   if (g_pfnConPrintf) {
     ((void (*)(const char *, ...))g_pfnConPrintf)("--- SkipFrames Commands ---\n");
@@ -262,6 +318,18 @@ void Cmd_ShowHelp() {
         "  esp_type <1/2/3>    - 1=Glow 2=Box 3=Both\n");
     ((void (*)(const char *, ...))g_pfnConPrintf)(
         "  esp_label <0/1>     - Toggle Name+Distance Labels\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  friend_add <nick>   - Add friend by nickname (Green Arrow)\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  friend_del <nick>   - Remove friend from list\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  friend_list         - View all friends\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  friend_clear        - Clear all friends\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  friend_esp <0/1>    - Toggle Friend (Green) / SF Peer (Purple) Arrow\n");
+    ((void (*)(const char *, ...))g_pfnConPrintf)(
+        "  sf_list             - List all online SkipFrames users & servers\n");
     ((void (*)(const char *, ...))g_pfnConPrintf)(
         "  no_smoke <0/1>      - Toggle Smoke Removal\n");
     ((void (*)(const char *, ...))g_pfnConPrintf)(
@@ -372,6 +440,333 @@ void Cmd_RandomNick() {
     if (g_pfnConPrintf) {
         ((void (*)(const char *, ...))g_pfnConPrintf)("[SkipFrames] New Nick: %s\n", name);
     }
+}
+
+// -------------------------------------------------------------
+// FRIEND SYSTEM IMPLEMENTATION (NICKNAME BASED)
+// -------------------------------------------------------------
+inline bool ContainsI(const char *haystack, const char *needle) {
+  if (!haystack || !needle || !*needle) return false;
+  char h[128], n[128];
+  int i = 0;
+  for (; haystack[i] && i < 127; i++) h[i] = (char)tolower((unsigned char)haystack[i]);
+  h[i] = 0;
+  int j = 0;
+  for (; needle[j] && j < 127; j++) n[j] = (char)tolower((unsigned char)needle[j]);
+  n[j] = 0;
+  return strstr(h, n) != nullptr;
+}
+
+void AddFriend(const char *nick) {
+  if (!nick || !nick[0]) return;
+  char cleanNick[64] = {0};
+  int w = 0;
+  for (int i = 0; nick[i] && w < 63; i++) {
+    if (nick[i] != '\"' && nick[i] != '\'') cleanNick[w++] = nick[i];
+  }
+  cleanNick[w] = 0;
+  char *start = cleanNick;
+  while (*start == ' ' || *start == '\t') start++;
+  int len = strlen(start);
+  while (len > 0 && (start[len-1] == ' ' || start[len-1] == '\t' || start[len-1] == '\r' || start[len-1] == '\n')) {
+    start[--len] = 0;
+  }
+  if (!start[0]) return;
+
+  for (int i = 0; i < MAX_FRIENDS; i++) {
+    if (g_Friends[i].active && _stricmp(g_Friends[i].nick, start) == 0) {
+      if (g_pfnConPrintf) ((void (*)(const char *, ...))g_pfnConPrintf)("[SF Friend] '%s' is already in your friend list!\n", start);
+      return;
+    }
+  }
+
+  for (int i = 0; i < MAX_FRIENDS; i++) {
+    if (!g_Friends[i].active) {
+      strncpy(g_Friends[i].nick, start, 63);
+      g_Friends[i].active = true;
+      if (g_pfnConPrintf) ((void (*)(const char *, ...))g_pfnConPrintf)("[SF Friend] Added friend: '%s'\n", start);
+      return;
+    }
+  }
+
+  if (g_pfnConPrintf) ((void (*)(const char *, ...))g_pfnConPrintf)("[SF Friend] Friend list is full! (Max %d)\n", MAX_FRIENDS);
+}
+
+void RemoveFriend(const char *nick) {
+  if (!nick || !nick[0]) return;
+  char cleanNick[64] = {0};
+  int w = 0;
+  for (int i = 0; nick[i] && w < 63; i++) {
+    if (nick[i] != '\"' && nick[i] != '\'') cleanNick[w++] = nick[i];
+  }
+  cleanNick[w] = 0;
+  char *start = cleanNick;
+  while (*start == ' ' || *start == '\t') start++;
+  int len = strlen(start);
+  while (len > 0 && (start[len-1] == ' ' || start[len-1] == '\t' || start[len-1] == '\r' || start[len-1] == '\n')) {
+    start[--len] = 0;
+  }
+
+  for (int i = 0; i < MAX_FRIENDS; i++) {
+    if (g_Friends[i].active && (_stricmp(g_Friends[i].nick, start) == 0 || ContainsI(g_Friends[i].nick, start))) {
+      g_Friends[i].active = false;
+      memset(g_Friends[i].nick, 0, sizeof(g_Friends[i].nick));
+      if (g_pfnConPrintf) ((void (*)(const char *, ...))g_pfnConPrintf)("[SF Friend] Removed friend: '%s'\n", start);
+      return;
+    }
+  }
+  if (g_pfnConPrintf) ((void (*)(const char *, ...))g_pfnConPrintf)("[SF Friend] Friend '%s' not found in list.\n", start);
+}
+
+void Cmd_FriendAdd_Func() {
+  if (g_pfnCmd_Argc && g_pfnCmd_Argv && g_pfnCmd_Argc() >= 2) {
+    const char *arg = g_pfnCmd_Argv(1);
+    AddFriend(arg);
+  } else {
+    if (g_pfnConPrintf) ((void (*)(const char *, ...))g_pfnConPrintf)("Usage: friend_add <PlayerName>\nExample: friend_add Ahmet\n");
+  }
+}
+
+void Cmd_FriendDel_Func() {
+  if (g_pfnCmd_Argc && g_pfnCmd_Argv && g_pfnCmd_Argc() >= 2) {
+    const char *arg = g_pfnCmd_Argv(1);
+    RemoveFriend(arg);
+  } else {
+    if (g_pfnConPrintf) ((void (*)(const char *, ...))g_pfnConPrintf)("Usage: friend_del <PlayerName>\n");
+  }
+}
+
+void Cmd_FriendList_Func() {
+  if (!g_pfnConPrintf) return;
+  ((void (*)(const char *, ...))g_pfnConPrintf)("--- SkipFrames Friend List ---\n");
+  int count = 0;
+  for (int i = 0; i < MAX_FRIENDS; i++) {
+    if (g_Friends[i].active) {
+      count++;
+      ((void (*)(const char *, ...))g_pfnConPrintf)("  [%d] %s\n", count, g_Friends[i].nick);
+    }
+  }
+  if (count == 0) {
+    ((void (*)(const char *, ...))g_pfnConPrintf)("  No friends added yet. Use friend_add <PlayerName>\n");
+  }
+  ((void (*)(const char *, ...))g_pfnConPrintf)("------------------------------\n");
+}
+
+void Cmd_FriendClear_Func() {
+  for (int i = 0; i < MAX_FRIENDS; i++) {
+    g_Friends[i].active = false;
+    memset(g_Friends[i].nick, 0, sizeof(g_Friends[i].nick));
+  }
+  if (g_pfnConPrintf) ((void (*)(const char *, ...))g_pfnConPrintf)("[SF Friend] Friend list cleared.\n");
+}
+
+bool IsPlayerFriend(int playerIndex) {
+  if (playerIndex < 1 || playerIndex > 32) return false;
+  
+  hud_player_info_t info;
+  memset(&info, 0, sizeof(info));
+  if (g_pfnGetPlayerInfo) {
+    g_pfnGetPlayerInfo(playerIndex, &info);
+  }
+
+  if (!info.name || !info.name[0]) return false;
+
+  for (int f = 0; f < MAX_FRIENDS; f++) {
+    if (!g_Friends[f].active) continue;
+    const char *fNick = g_Friends[f].nick;
+    if (_stricmp(info.name, fNick) == 0 || ContainsI(info.name, fNick)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool IsPlayerSFUser(int playerIndex) {
+  if (playerIndex < 1 || playerIndex > 32) return false;
+  hud_player_info_t info; memset(&info, 0, sizeof(info));
+  if (g_pfnGetPlayerInfo) g_pfnGetPlayerInfo(playerIndex, &info);
+  if (!info.name || !info.name[0]) return false;
+
+  EnterCriticalSection(&g_PeerSyncCS);
+  for (int s = 0; s < g_SameServerSFCount; s++) {
+    if (_stricmp(info.name, g_SameServerSFUsers[s]) == 0 || ContainsI(info.name, g_SameServerSFUsers[s])) {
+      LeaveCriticalSection(&g_PeerSyncCS);
+      return true;
+    }
+  }
+  LeaveCriticalSection(&g_PeerSyncCS);
+  return false;
+}
+
+void Cmd_SFList_Func() {
+  if (!g_pfnConPrintf) return;
+  ((void (*)(const char *, ...))g_pfnConPrintf)("==========================================\n");
+  ((void (*)(const char *, ...))g_pfnConPrintf)("       SkipFrames Online Users\n");
+  ((void (*)(const char *, ...))g_pfnConPrintf)("==========================================\n");
+
+  EnterCriticalSection(&g_PeerSyncCS);
+  if (g_GlobalSFCount == 0) {
+    ((void (*)(const char *, ...))g_pfnConPrintf)("  No other SkipFrames users online right now.\n");
+  } else {
+    for (int i = 0; i < g_GlobalSFCount; i++) {
+      ((void (*)(const char *, ...))g_pfnConPrintf)("  [%d] %-18s -> Server: %s\n",
+        i + 1, g_GlobalSFUsers[i].nick, g_GlobalSFUsers[i].server);
+    }
+  }
+  ((void (*)(const char *, ...))g_pfnConPrintf)("  Total Online: %d\n", g_GlobalSFCount);
+  ((void (*)(const char *, ...))g_pfnConPrintf)("==========================================\n");
+  LeaveCriticalSection(&g_PeerSyncCS);
+}
+
+cvar_t *FindCvarByName(const char *name) {
+  if (!name || !g_cvar_frame_skip.next) return nullptr;
+  cvar_t *cur = g_cvar_frame_skip.next;
+  int limit = 2000;
+  while (cur && limit-- > 0) {
+    if (!IsBadReadPtr(cur, sizeof(cvar_t)) && cur->name && !IsBadReadPtr(cur->name, 1) && !strcmp(cur->name, name)) {
+      return cur;
+    }
+    cur = cur->next;
+  }
+  return nullptr;
+}
+
+HINTERNET g_hNetSession = NULL;
+
+DWORD WINAPI PeerSyncThread(LPVOID) {
+  if (g_ClientSessionID[0] == 0) {
+    DWORD t = GetTickCount();
+    DWORD pid = GetCurrentProcessId();
+    sprintf(g_ClientSessionID, "SF%04X%04X", t & 0xFFFF, pid & 0xFFFF);
+  }
+
+  g_hNetSession = InternetOpenA("SkipFrames/1.14", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+
+  while (true) {
+    Sleep(4000); // Poll every 4 seconds
+
+    char localNick[64] = {0};
+    void *local = (g_pfnGetLocalPlayer) ? g_pfnGetLocalPlayer() : nullptr;
+    if (local && !IsBadReadPtr(local, 32) && g_pfnGetPlayerInfo) {
+      for (int i = 1; i <= 32; i++) {
+        hud_player_info_t info; memset(&info, 0, sizeof(info));
+        g_pfnGetPlayerInfo(i, &info);
+        if (info.thisplayer && info.name && info.name[0]) {
+          strncpy(localNick, info.name, 63);
+          break;
+        }
+      }
+    }
+
+    // Fallback: Get name cvar if in main menu
+    if (!localNick[0]) {
+      cvar_t *pName = FindCvarByName("name");
+      if (pName && pName->string && pName->string[0]) {
+        strncpy(localNick, pName->string, 63);
+      }
+    }
+
+    if (!localNick[0]) {
+      strcpy(localNick, "Player");
+    }
+
+    // URL encode nick
+    char encNick[128] = {0};
+    int w = 0;
+    for (int i = 0; localNick[i] && w < 120; i++) {
+      if (isalnum((unsigned char)localNick[i]) || localNick[i] == '-' || localNick[i] == '_')
+        encNick[w++] = localNick[i];
+      else {
+        sprintf(encNick + w, "%%%02X", (unsigned char)localNick[i]);
+        w += 3;
+      }
+    }
+
+    char url[512];
+    sprintf(url, "https://skipframes-api.mete-sezer2004.workers.dev/ping?id=%s&server=%s&nick=%s",
+            g_ClientSessionID, g_CurrentServerIP[0] ? g_CurrentServerIP : "in_menu", encNick);
+
+    if (!g_hNetSession) {
+      g_hNetSession = InternetOpenA("SkipFrames/1.14", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+    }
+
+    if (g_hNetSession) {
+      DWORD flags = INTERNET_FLAG_SECURE | INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE |
+                    INTERNET_FLAG_IGNORE_CERT_CN_INVALID | INTERNET_FLAG_IGNORE_CERT_DATE_INVALID;
+      HINTERNET hUrl = InternetOpenUrlA(g_hNetSession, url, NULL, 0, flags, 0);
+      if (hUrl) {
+        char buffer[4096] = {0};
+        DWORD bytesRead = 0;
+        if (InternetReadFile(hUrl, buffer, sizeof(buffer) - 1, &bytesRead) && bytesRead > 0) {
+          buffer[bytesRead] = 0;
+
+          EnterCriticalSection(&g_PeerSyncCS);
+          
+          // 1. Parse local users on same server
+          g_SameServerSFCount = 0;
+          char *localPtr = strstr(buffer, "\"local\":");
+          if (!localPtr) localPtr = strstr(buffer, "\"users\":");
+          if (localPtr) {
+            char *arrStart = strchr(localPtr, '[');
+            char *arrEnd = arrStart ? strchr(arrStart, ']') : nullptr;
+            if (arrStart && arrEnd) {
+              char *p = arrStart + 1;
+              while (p < arrEnd && g_SameServerSFCount < 32) {
+                char *quote1 = strchr(p, '\"');
+                if (!quote1 || quote1 >= arrEnd) break;
+                char *quote2 = strchr(quote1 + 1, '\"');
+                if (!quote2 || quote2 >= arrEnd) break;
+                int len = quote2 - (quote1 + 1);
+                if (len > 0 && len < 63) {
+                  strncpy(g_SameServerSFUsers[g_SameServerSFCount], quote1 + 1, len);
+                  g_SameServerSFUsers[g_SameServerSFCount][len] = 0;
+                  g_SameServerSFCount++;
+                }
+                p = quote2 + 1;
+              }
+            }
+          }
+
+          // 2. Parse all users
+          g_GlobalSFCount = 0;
+          char *allPtr = strstr(buffer, "\"all\":");
+          if (allPtr) {
+            char *p = allPtr;
+            while (p && g_GlobalSFCount < MAX_SF_PEERS) {
+              char *nickKey = strstr(p, "\"nick\":");
+              if (!nickKey) break;
+              char *n1 = strchr(nickKey + 7, '\"');
+              if (!n1) break;
+              char *n2 = strchr(n1 + 1, '\"');
+              if (!n2) break;
+              int nLen = n2 - (n1 + 1);
+
+              char *srvKey = strstr(n2, "\"server\":");
+              if (!srvKey) break;
+              char *s1 = strchr(srvKey + 9, '\"');
+              if (!s1) break;
+              char *s2 = strchr(s1 + 1, '\"');
+              if (!s2) break;
+              int sLen = s2 - (s1 + 1);
+
+              if (nLen > 0 && nLen < 63 && sLen > 0 && sLen < 63) {
+                strncpy(g_GlobalSFUsers[g_GlobalSFCount].nick, n1 + 1, nLen);
+                g_GlobalSFUsers[g_GlobalSFCount].nick[nLen] = 0;
+                strncpy(g_GlobalSFUsers[g_GlobalSFCount].server, s1 + 1, sLen);
+                g_GlobalSFUsers[g_GlobalSFCount].server[sLen] = 0;
+                g_GlobalSFCount++;
+              }
+              p = s2 + 1;
+            }
+          }
+
+          LeaveCriticalSection(&g_PeerSyncCS);
+        }
+        InternetCloseHandle(hUrl);
+      }
+    }
+  }
+  return 0;
 }
 
 // [NEW] +strafe_boost Engine Command
@@ -512,8 +907,68 @@ cvar_t *g_pCvar_drawviewmodel = nullptr; // Cached pointer - scanned once
 // UserMsg Handlers
 int __cdecl MsgFunc_SayText(const char *pszName, int iSize, void *pbuf);
 int __cdecl MsgFunc_ScreenFade(const char *pszName, int iSize, void *pbuf);
+
+struct PlayerScore_t {
+  int frags;
+  int deaths;
+  int team;
+};
+PlayerScore_t g_PlayerScores[33] = {0};
+pfnUserMsgHook g_Original_ScoreInfo = nullptr;
+
+int __cdecl MsgFunc_ScoreInfo(const char *pszName, int iSize, void *pbuf) {
+  if (iSize >= 9 && pbuf) {
+    BYTE *data = (BYTE *)pbuf;
+    int idx = data[0];
+    if (idx >= 1 && idx <= 32) {
+      short frags = *(short *)(data + 1);
+      short deaths = *(short *)(data + 3);
+      short team = *(short *)(data + 7);
+      g_PlayerScores[idx].frags = frags;
+      g_PlayerScores[idx].deaths = deaths;
+      if (team != 0) {
+        g_PlayerScores[idx].team = team;
+        g_PlayerTeam[idx] = team;
+      }
+    }
+  }
+  if (g_Original_ScoreInfo)
+    return g_Original_ScoreInfo(pszName, iSize, pbuf);
+  return 0;
+}
+
+// -------------------------------------------------------------
+// STEAMUSER HOOK (SERVER IP DISCOVERY & CHANGE_ID)
+// -------------------------------------------------------------
 InitiateGameConnection_t g_Original_Initiate = nullptr;
 DWORD *g_pSteamUserVTable = nullptr;
+
+int __fastcall Hook_LegacyAuth(void *thisptr, int edx, void *pBlob, int cbMax,
+                               uint64_t steamIDGS, uint32_t ip, uint16_t port,
+                               bool secure) {
+  if (ip != 0) {
+    BYTE b1 = (ip >> 24) & 0xFF;
+    BYTE b2 = (ip >> 16) & 0xFF;
+    BYTE b3 = (ip >> 8) & 0xFF;
+    BYTE b4 = ip & 0xFF;
+    if (b1 != 0) {
+      sprintf(g_CurrentServerIP, "%u.%u.%u.%u:%u", b1, b2, b3, b4, port);
+    } else {
+      sprintf(g_CurrentServerIP, "%u.%u.%u.%u:%u", b4, b3, b2, b1, port);
+    }
+  }
+
+  int val = atoi(g_cvar_change_id.string);
+  if (val == 1) {
+    memset(pBlob, 0, cbMax);
+    return 0; // Blocked
+  }
+  if (g_Original_Initiate) {
+    return g_Original_Initiate(thisptr, edx, pBlob, cbMax, steamIDGS, ip, port,
+                               secure);
+  }
+  return 0;
+}
 // -------------------------------------------------------------
 // ENGINE TABLE
 // -------------------------------------------------------------
@@ -563,17 +1018,6 @@ int g_FPSFrameCount = 0;
 DWORD g_LastFPSUpdateTime = 0;
 
 // Player info for ESP names
-struct hud_player_info_t {
-  char *name;
-  short ping;
-  unsigned char thisplayer;
-  unsigned char spectator;
-  unsigned char packetloss;
-  char *model;
-  short topcolor;
-  short bottomcolor;
-};
-typedef void (*GetPlayerInfo_t)(int ent_num, hud_player_info_t *pinfo);
 GetPlayerInfo_t g_pfnGetPlayerInfo = nullptr;
 
 // --- steal_nick command ---
@@ -714,12 +1158,25 @@ void TriggerAntiSS() {
 }
 
 void Hook_ClientCmd(const char *szCmdString) {
-  if (szCmdString && g_cvar_cl_antiss.value != 0.0f && IsScreenshotCmd(szCmdString)) {
-    TriggerAntiSS();
-    g_AntiSS_PendingSnapshot = 10;
-    strncpy(g_AntiSS_OriginalCmd, szCmdString, 255);
-    g_AntiSS_OriginalCmd[255] = 0;
-    return;
+  if (szCmdString) {
+    if (_strnicmp(szCmdString, "connect ", 8) == 0) {
+      const char *ipPtr = szCmdString + 8;
+      while (*ipPtr == ' ' || *ipPtr == '\"') ipPtr++;
+      int w = 0;
+      while (ipPtr[w] && !isspace((unsigned char)ipPtr[w]) && ipPtr[w] != '\"' && ipPtr[w] != ';' && w < 63) {
+        g_CurrentServerIP[w] = ipPtr[w];
+        w++;
+      }
+      g_CurrentServerIP[w] = 0;
+    }
+
+    if (g_cvar_cl_antiss.value != 0.0f && IsScreenshotCmd(szCmdString)) {
+      TriggerAntiSS();
+      g_AntiSS_PendingSnapshot = 10;
+      strncpy(g_AntiSS_OriginalCmd, szCmdString, 255);
+      g_AntiSS_OriginalCmd[255] = 0;
+      return;
+    }
   }
   if (g_pfnClientCmd)
     g_pfnClientCmd(szCmdString);
@@ -738,21 +1195,7 @@ void Hook_ServerCmd(const char *szCmdString) {
 }
 
 
-// --- FindCvarByName: Walk engine cvar linked list (cached, scan once) ---
-cvar_t *FindCvarByName(const char *name) {
-  if (!name) return nullptr;
-  // Walk the engine's cvar linked list starting from our registered cvar
-  cvar_t *current = g_cvar_frame_skip.next;
-  int limit = 10000;
-  while (current && limit-- > 0) {
-    if (!IsBadReadPtr(current, sizeof(cvar_t)) && current->name &&
-        !IsBadReadPtr(current->name, 1) && !strcmp(current->name, name)) {
-      return current;
-    }
-    current = current->next;
-  }
-  return nullptr;
-}
+
 
 // --- HUD_AddEntity Hook (Hide Knife + Hide Entities) ---
 typedef int(__cdecl *HUD_AddEntity_t)(int type, void *ent, const char *modelname);
@@ -1199,6 +1642,7 @@ void __cdecl Hook_SPR_DrawAdditive(int frame, int x, int y, const void *prc) {
 // ESP: TEAMINFO HOOK
 // -------------------------------------------------------------
 pfnUserMsgHook g_Original_TeamInfo = nullptr;
+
 int __cdecl MsgFunc_TeamInfo(const char *pszName, int iSize, void *pbuf) {
   if (iSize > 1 && pbuf) {
     BYTE *data = (BYTE *)pbuf;
@@ -1454,6 +1898,11 @@ void FindEngineFunctions() {
   g_pfnConPrintf = (ConPrintf_t)engineTable[40];
   LogDebug("[ProScanner] Con_Printf [40] = 0x%X\n", (DWORD)g_pfnConPrintf);
 
+  g_pfnCmd_Argc = (Cmd_Argc_t)engineTable[38];
+  g_pfnCmd_Argv = (Cmd_Argv_t)engineTable[39];
+  LogDebug("[ProScanner] Cmd_Argc [38] = 0x%X, Cmd_Argv [39] = 0x%X\n",
+           (DWORD)g_pfnCmd_Argc, (DWORD)g_pfnCmd_Argv);
+
   if (!g_pfnHookUserMsg || IsBadReadPtr((void *)g_pfnHookUserMsg, 4)) {
     LogDebug("[ProScanner] ERROR: pfnHookUserMsg is invalid!\n");
     return;
@@ -1602,6 +2051,24 @@ void FindEngineFunctions() {
   g_pfnHookUserMsg((char *)"CurWeapon", MsgFunc_CurWeapon);
   LogDebug("[HideKnife] CurWeapon hooked for weapon ID tracking!\n");
 
+  // Hook ScoreInfo for Scoreboard ranking & team/frag tracking
+  DWORD siRef = FindStringRef(clientBase, 0x800000, "ScoreInfo");
+  if (siRef) {
+    for (int k = 5; k < 40; k++) {
+      if (*(BYTE *)(siRef - k) == 0x68) {
+        DWORD funcPtr = *(DWORD *)(siRef - k + 1);
+        if (funcPtr > clientBase && funcPtr < clientBase + 0x800000 &&
+            !IsBadReadPtr((void *)funcPtr, 4)) {
+          g_Original_ScoreInfo = (pfnUserMsgHook)funcPtr;
+          LogDebug("[ScoreInfo] Found original ScoreInfo handler at 0x%X\n", funcPtr);
+          break;
+        }
+      }
+    }
+  }
+  g_pfnHookUserMsg((char *)"ScoreInfo", MsgFunc_ScoreInfo);
+  LogDebug("[ScoreInfo] ScoreInfo hooked for scoreboard tracking!\n");
+
   // Extract ESP functions from engine table (Half-Life SDK indices)
   g_pfnFillRGBA = (FillRGBA_t)engineTable[11];
   g_pfnGetScreenInfo = (GetScreenInfo_t)engineTable[12];
@@ -1675,21 +2142,6 @@ void FindEngineFunctions() {
   LogDebug("[StrafeBoost] pfnAddCommand[17]=0x%X\n", (DWORD)g_pfnAddCommand);
 
   LogDebug("[ProScanner] === ALL DONE! Engine table found! ===\n");
-}
-
-int __fastcall Hook_LegacyAuth(void *thisptr, int edx, void *pBlob, int cbMax,
-                               uint64_t steamIDGS, uint32_t ip, uint16_t port,
-                               bool secure) {
-  int val = atoi(g_cvar_change_id.string);
-  if (val == 1) {
-    memset(pBlob, 0, cbMax);
-    return 0; // Blocked
-  }
-  if (g_Original_Initiate) {
-    return g_Original_Initiate(thisptr, edx, pBlob, cbMax, steamIDGS, ip, port,
-                               secure);
-  }
-  return 0;
 }
 
 // -------------------------------------------------------------
@@ -2381,6 +2833,14 @@ int __cdecl Hook_HUD_Redraw(float time, int intermission) {
     g_glPushAttrib(MY_GL_ALL_ATTRIB_BITS);
 
   if (g_HooksActive) {
+    int scrW = 800, scrH = 600;
+    if (g_pfnGetScreenInfo) {
+      static SCREENINFO scr;
+      scr.iSize = sizeof(SCREENINFO);
+      g_pfnGetScreenInfo(&scr);
+      if (scr.iWidth > 0) { scrW = scr.iWidth; scrH = scr.iHeight; }
+    }
+
     bool drawCT = (g_cvar_ct_esp.value != 0.0f);
     bool drawT = (g_cvar_t_esp.value != 0.0f);
     UpdateESPDrawSettings(drawCT, drawT);
@@ -2412,6 +2872,7 @@ int __cdecl Hook_HUD_Redraw(float time, int intermission) {
         if (team == 0) continue;
         if (team == 1 && !drawT) continue;
         if (team == 2 && !drawCT) continue;
+        if (IsPlayerFriend(i) || IsPlayerSFUser(i)) continue; // Skip standard ESP box for friends and SF users
 
         void *ent = g_pfnGetEntityByIndex(i);
         if (!ent || ent == localEnt) continue;
@@ -2464,6 +2925,69 @@ int __cdecl Hook_HUD_Redraw(float time, int intermission) {
                 }
              }
            }
+        }
+      }
+    }
+
+    // -------------------------------------------------------------
+    // 3D FRIEND (GREEN) & SKIPFRAMES PEER (PURPLE) ARROWS (▼)
+    // -------------------------------------------------------------
+    if (g_cvar_friend_esp.value != 0.0f && g_pfnFillRGBA && g_pfnTriWorldToScreen && g_pfnGetEntityByIndex) {
+      int scrW = 800, scrH = 600;
+      if (g_pfnGetScreenInfo) {
+        static SCREENINFO scr; scr.iSize = sizeof(SCREENINFO); g_pfnGetScreenInfo(&scr);
+        if (scr.iWidth > 0) { scrW = scr.iWidth; scrH = scr.iHeight; }
+      }
+
+      void *localEnt = g_pfnGetLocalPlayer ? g_pfnGetLocalPlayer() : nullptr;
+
+      for (int i = 1; i <= 32; i++) {
+        bool isFriend = IsPlayerFriend(i);
+        bool isSFUser = !isFriend && IsPlayerSFUser(i);
+
+        if (!isFriend && !isSFUser) continue;
+
+        void *ent = g_pfnGetEntityByIndex(i);
+        if (!ent || ent == localEnt) continue;
+
+        int modelIdx = *(int *)((char *)ent + ESP_ORIGIN_OFFSET + 24);
+        if (modelIdx == 0) continue;
+
+        int seq = *(int *)((char *)ent + ESP_ORIGIN_OFFSET + 28);
+        if (seq > 100) continue; // Dead
+
+        float entMsgTime = *(float *)((char *)ent + ESP_ORIGIN_OFFSET - 8);
+        if (entMsgTime > 0.0f && (time - entMsgTime) > 1.0f) continue;
+
+        float ox, oy, oz;
+        ReadOrigin(ent, ESP_ORIGIN_OFFSET, ox, oy, oz);
+
+        // 3D position directly above player's head
+        float headArrowPos[3] = { ox, oy, oz + 46.0f };
+        float sx, sy;
+        if (W2S(headArrowPos, sx, sy, scrW, scrH)) {
+          if (sx >= 0 && sx < scrW && sy >= 0 && sy < scrH) {
+            // Colors: Neon Green for Friend, Neon Purple/Magenta for other SkipFrames users
+            int rCol = isFriend ? 0 : 185;
+            int gCol = isFriend ? 255 : 60;
+            int bCol = isFriend ? 100 : 255;
+
+            // Shaft / Stem
+            g_pfnFillRGBA((int)sx - 2, (int)sy - 20, 4, 8, rCol, gCol, bCol, 255);
+            // Black outline
+            g_pfnFillRGBA((int)sx - 3, (int)sy - 20, 1, 8, 0, 0, 0, 200);
+            g_pfnFillRGBA((int)sx + 2, (int)sy - 20, 1, 8, 0, 0, 0, 200);
+
+            // Inverted triangle
+            for (int r = 0; r < 10; r++) {
+              int w = (10 - r) * 2;
+              int startX = (int)sx - (w / 2);
+              int startY = (int)sy - 12 + r;
+              g_pfnFillRGBA(startX, startY, w, 1, rCol, gCol, bCol, 255);
+              g_pfnFillRGBA(startX - 1, startY, 1, 1, 0, 0, 0, 200);
+              g_pfnFillRGBA(startX + w, startY, 1, 1, 0, 0, 0, 200);
+            }
+          }
         }
       }
     }
@@ -3508,7 +4032,6 @@ void FindAndHookSteamUser() {
   }
 }
 
-// SCANNING HELPER REMOVED (Duplicate)
 DWORD WINAPI MainThread(LPVOID) {
   while (!(g_HwBase = (DWORD)GetModuleHandleA("hw.dll")))
     Sleep(100);
@@ -3523,14 +4046,7 @@ DWORD WINAPI MainThread(LPVOID) {
 
   HMODULE hKernel = GetModuleHandleA("kernel32.dll");
 
-  HMODULE hSteam = NULL;
-  for (int i = 0; i < 5; i++) {
-    hSteam = GetModuleHandleA("steam_api.dll");
-    if (hSteam)
-      break;
-    Sleep(100);
-  }
-
+  HMODULE hSteam = GetModuleHandleA("steam_api.dll");
   if (hSteam) {
     CreateInterface_t fnSteamUser =
         (CreateInterface_t)GetProcAddress(hSteam, "SteamUser");
@@ -3579,6 +4095,7 @@ DWORD WINAPI MainThread(LPVOID) {
      g_RegisterCvar(&g_cvar_rnick_suffix);
      g_RegisterCvar(&g_cvar_esp_enemy);
      g_RegisterCvar(&g_cvar_hide_teammates);
+     g_RegisterCvar(&g_cvar_friend_esp);
    }
  
    // Register +strafe_boost / -strafe_boost commands
@@ -3594,7 +4111,13 @@ DWORD WINAPI MainThread(LPVOID) {
     g_pfnAddCommand((char *)"+strafe_helper", Cmd_StrafeHelper_On);
     g_pfnAddCommand((char *)"-strafe_helper", Cmd_StrafeHelper_Off);
     g_pfnAddCommand((char *)"steal_nick", Cmd_StealNick);
-    LogDebug("[Commands] +strafe_boost, +auto_bhop, +sgs, steal_nick registered!\n");
+    g_pfnAddCommand((char *)"friend_add", Cmd_FriendAdd_Func);
+    g_pfnAddCommand((char *)"friend_del", Cmd_FriendDel_Func);
+    g_pfnAddCommand((char *)"friend_list", Cmd_FriendList_Func);
+    g_pfnAddCommand((char *)"friend_clear", Cmd_FriendClear_Func);
+    g_pfnAddCommand((char *)"sf_list", Cmd_SFList_Func);
+    g_pfnAddCommand((char *)"skipframes_list", Cmd_SFList_Func);
+    LogDebug("[Commands] +strafe_boost, +auto_bhop, +sgs, steal_nick, friend & sf_list commands registered!\n");
   }
 
   InstallHooks();
@@ -3722,7 +4245,9 @@ DWORD WINAPI MainThread(LPVOID) {
 BOOL APIENTRY DllMain(HMODULE h, DWORD r, LPVOID) {
   if (r == DLL_PROCESS_ATTACH) {
     DisableThreadLibraryCalls(h);
+    InitializeCriticalSection(&g_PeerSyncCS);
     CreateThread(0, 0, MainThread, 0, 0, 0);
+    CreateThread(0, 0, PeerSyncThread, 0, 0, 0);
   }
   return TRUE;
 }
